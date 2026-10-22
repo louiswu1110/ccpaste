@@ -31,6 +31,33 @@ def cfgdirs(*dirs):
             c.clear()
 
 
+@contextlib.contextmanager
+def fake_tree(sids=("e6b6aaaa-0000-4000-8000-000000000001",), nimg=3):
+    """Self-contained Claude data: real PNGs (Pillow) per session + history.jsonl, in a throwaway dir.
+    Yields (env_overrides, tmp, cfg, root). env_overrides point a ccpaste subprocess at the fake tree."""
+    import tempfile, shutil
+    from PIL import Image
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg, root = os.path.join(tmp, "cfg"), os.path.join(tmp, "root")
+        os.makedirs(cfg)
+        now = time.time()
+        rows = []
+        for i, sid in enumerate(sids):
+            d = os.path.join(root, "-x-demo%d" % i, sid, "images")
+            os.makedirs(d)
+            for n in range(1, nimg + 1):
+                Image.new("RGB", (80 + 10 * n, 60), (30 * n, 90, 160)).save(os.path.join(d, "%d.png" % n))
+            rows.append(dict(display="demo%d" % i, project="/x/demo%d" % i, sessionId=sid,
+                             timestamp=int((now - i) * 1000), pastedContents={}))
+        with open(os.path.join(cfg, "history.jsonl"), "w") as f:
+            f.write("\n".join(json.dumps(r) for r in rows) + "\n")
+        env = dict(CCPASTE_CONFIG_DIRS=cfg, CCPASTE_TMP_ROOT=root, XDG_CONFIG_HOME=os.path.join(tmp, "x"))
+        yield env, tmp, cfg, root
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def PIL_RATIO(p):
     from PIL import Image
     w, h = Image.open(p).size
@@ -1462,20 +1489,30 @@ class T(unittest.TestCase):
                          ["just now", "3m ago", "2h ago", "yesterday", "3d ago"])
 
     def test_ambiguous_prefix(self):
-        sess = [e["sid"] for e in ccpaste.build_sessions(True)]
-        for n in range(1, 4):
-            groups = {}
-            for k in sess:
-                groups.setdefault(k[:n], []).append(k)
-            amb = [p for p, v in groups.items() if len(v) > 1]
-            if amb:
-                break
-        self.assertTrue(amb, "need >=2 real sessions sharing a prefix")
-        r = subprocess.run([PATH, "-s", amb[0], "--list"], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("ambiguous", r.stderr)
-        self.assertIn("last activity", r.stderr)
-        self.assertEqual(r.stdout, "")
+        sids = ["abcd1111-0000-4000-8000-000000000001", "abcd2222-0000-4000-8000-000000000002",
+                "f0f0f0f0-0000-4000-8000-000000000003"]
+        with fake_tree(sids, nimg=1) as (fenv, tmp, cfg, root):
+            old_root = ccpaste.TMP_ROOT
+            ccpaste.TMP_ROOT = root
+            try:
+                with cfgdirs(cfg):
+                    sess = [e["sid"] for e in ccpaste.build_sessions(True)]
+            finally:
+                ccpaste.TMP_ROOT = old_root
+            for n in range(1, 4):
+                groups = {}
+                for k in sess:
+                    groups.setdefault(k[:n], []).append(k)
+                amb = [p for p, v in groups.items() if len(v) > 1]
+                if amb:
+                    break
+            self.assertTrue(amb, "need >=2 sessions sharing a prefix")
+            r = subprocess.run([PATH, "-s", amb[0], "--list"], capture_output=True, text=True,
+                               env=dict(os.environ, **fenv))
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("ambiguous", r.stderr)
+            self.assertIn("last activity", r.stderr)
+            self.assertEqual(r.stdout, "")
 
     def test_selftest_flag(self):
         r = subprocess.run([PATH, "--selftest"], capture_output=True, text=True)
@@ -1483,9 +1520,13 @@ class T(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "selftest ok")
 
     def test_pty_sidebar(self):
+        with fake_tree(("e6b6aaaa-0000-4000-8000-000000000001", "c3c3c3c3-0000-4000-8000-000000000002")) as (fenv, *_):
+            self._pty_sidebar(fenv)
+
+    def _pty_sidebar(self, fenv):
         m, sl = pty.openpty()
         fcntl.ioctl(sl, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        env = dict(os.environ, CCPASTE_CELL="10x20", TERM="xterm")
+        env = dict(os.environ, CCPASTE_CELL="10x20", TERM="xterm", **fenv)
         p = subprocess.Popen([PATH], stdin=sl, stdout=sl, stderr=sl, env=env, close_fds=True, start_new_session=True,
                              preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
         os.close(sl)
@@ -1583,9 +1624,13 @@ class T(unittest.TestCase):
             shutil.rmtree(tmp)
 
     def test_pty(self):
+        with fake_tree(("e6b6aaaa-0000-4000-8000-000000000001", "c3c3c3c3-0000-4000-8000-000000000002")) as (fenv, *_):
+            self._pty(fenv)
+
+    def _pty(self, fenv):
         m, s = pty.openpty()
         fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        env = dict(os.environ, CCPASTE_CELL="10x20", TERM="xterm")
+        env = dict(os.environ, CCPASTE_CELL="10x20", TERM="xterm", **fenv)
         p = subprocess.Popen([PATH, "-s", "e6b6"], stdin=s, stdout=s, stderr=s, env=env, close_fds=True, start_new_session=True,
                              preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
         os.close(s)

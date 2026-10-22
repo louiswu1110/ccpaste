@@ -1,6 +1,10 @@
 """Smoke-test a ccpaste build: `--selftest` (Pillow + sixel encoder), then fake Claude data, then `--list` and `-s <id> --list` must succeed."""
 import json, os, subprocess, sys, tempfile, time
 
+for _s in (sys.stdout, sys.stderr):     # Windows runners default to cp1252; ccpaste prints '★'
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 cmd = sys.argv[1:]                      # e.g. dist/ccpaste.exe   or   python ccpaste
 st = subprocess.run(cmd + ["--selftest"], capture_output=True, text=True, encoding="utf-8")
 print(st.stdout, st.stderr, sep="")
