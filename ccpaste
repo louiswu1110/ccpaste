@@ -2742,8 +2742,19 @@ def main():
     ap = argparse.ArgumentParser(prog="ccpaste", description="Browse images/text pasted into a Claude Code session.")
     ap.add_argument("-s", "--session", help="session id prefix: open this session directly instead of the session list")
     ap.add_argument("--list", action="store_true", help="print the session list (or, with -s, that session's items), then exit")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--hide-older", type=int, metavar="N", help="hide sessions whose last activity is older than N days (not saved)")
     a = ap.parse_args()
+    if a.selftest:                                        # CI: prove Pillow + the sixel encoder work in a frozen build
+        try:
+            from PIL import Image
+            out = encode_sixel(Image.new("RGB", (16, 12), (40, 90, 160)))
+            assert out.startswith(b"\x1bP") and out.endswith(b"\x1b\\"), "bad sixel framing"
+        except Exception as e:
+            print("selftest failed: %r" % e, file=sys.stderr)
+            return 1
+        print("selftest ok")
+        return 0
     HIDE.load()
     if a.hide_older:
         HIDE.auto_cli = a.hide_older
@@ -2761,6 +2772,11 @@ def main():
             return 1
         sid, _, proj = (exact or m)[0]
     if a.list:
+        if not sys.stdout.isatty() and hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Windows pipes default to cp1252
+            except Exception:
+                pass
         if sid:
             print("session %s  %s" % (sid[:8], proj))
             for it in list_items(sid):

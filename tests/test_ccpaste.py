@@ -1477,6 +1477,11 @@ class T(unittest.TestCase):
         self.assertIn("last activity", r.stderr)
         self.assertEqual(r.stdout, "")
 
+    def test_selftest_flag(self):
+        r = subprocess.run([PATH, "--selftest"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "selftest ok")
+
     def test_pty_sidebar(self):
         m, sl = pty.openpty()
         fcntl.ioctl(sl, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
