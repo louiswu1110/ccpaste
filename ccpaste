@@ -1,0 +1,2806 @@
+#!/usr/bin/env python3
+"""ccpaste - browse images and long text pasted into a Claude Code session (Sixel TUI).
+
+Stdlib + Pillow only.
+"""
+import argparse, atexit, collections, json, os, queue, re, signal, struct, sys, threading, time, unicodedata
+
+IS_WIN = os.name == "nt"
+if not IS_WIN:                      # Unix-only modules must not be imported on Windows
+    import fcntl, termios, tty
+
+TWMIN, TWMAX, TH = 16, 24, 7   # thumbnail cell: min/max columns, rows (bar, 5 image rows, label)
+RH = 7                         # session-list row: text line + 5 thumbnail rows + label line
+THUMB_ROWS = 5
+def default_tmp_root(environ=os.environ, win=IS_WIN):
+    """Claude Code keeps pasted images under ${CLAUDE_CODE_TMPDIR:-/tmp}/claude-<uid> (Unix) or
+    <CLAUDE_CODE_TMPDIR or %TEMP%>\\claude (Windows; no uid; layout from a third-party plugin, unverified)."""
+    if environ.get("CCPASTE_TMP_ROOT"):
+        return environ["CCPASTE_TMP_ROOT"]
+    base = (environ.get("CLAUDE_CODE_TMPDIR") or "").rstrip("/\\" if win else "/")
+    if win:
+        import tempfile
+        return os.path.join(base or environ.get("TEMP") or environ.get("TMP") or tempfile.gettempdir(), "claude")
+    return "%s/claude-%d" % (base or "/tmp", os.getuid())
+
+
+TMP_ROOT = default_tmp_root()
+ESC = "\x1b"
+
+
+# ---------------------------------------------------------------- sessions / items
+def config_dirs(environ=os.environ, win=IS_WIN):
+    """Every Claude Code config dir: CCPASTE_CONFIG_DIRS (colon separated) if set, else $CLAUDE_CONFIG_DIR,
+    ~/.claude and each ~/.claude-* that has projects/ or history.jsonl (users run profiles via aliases that set
+    CLAUDE_CONFIG_DIR only for one command, so the env var alone is not enough)."""
+    over = environ.get("CCPASTE_CONFIG_DIRS")
+    if over:
+        cand = [d for d in over.split(";" if win else ":") if d]
+    else:
+        home = environ.get("USERPROFILE" if win else "HOME") or os.path.expanduser("~")
+        cand = [environ.get("CLAUDE_CONFIG_DIR") or "", os.path.join(home, ".claude")]
+        try:
+            cand += sorted(os.path.join(home, n) for n in os.listdir(home) if n.startswith(".claude-"))
+        except OSError:
+            pass
+    out, seen = [], set()
+    for d in cand:
+        if not d:
+            continue
+        rp = os.path.realpath(d)
+        if rp in seen or not os.path.isdir(rp):
+            continue
+        explicit = bool(over) or d == environ.get("CLAUDE_CONFIG_DIR")
+        if explicit or os.path.isdir(os.path.join(rp, "projects")) or os.path.isfile(os.path.join(rp, "history.jsonl")):
+            seen.add(rp)
+            out.append(d)
+    return out
+
+
+_hist_cache = {}      # history path -> (sig, entries)
+
+
+def read_history():
+    """history.jsonl entries of all config dirs, deduplicated; each entry gets "_dir" = its config dir."""
+    out, seen = [], set()
+    for d in config_dirs():
+        path = os.path.join(d, "history.jsonl")
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        sig = (st.st_mtime_ns, st.st_size)
+        c = _hist_cache.get(path)
+        if c is None or c[0] != sig:
+            ents = []
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            e = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(e, dict) and e.get("sessionId"):
+                            e["_dir"] = d
+                            ents.append(e)
+            except OSError:
+                continue
+            c = _hist_cache[path] = (sig, ents)
+        for e in c[1]:
+            k = (e["sessionId"], e.get("timestamp"), e.get("display"))
+            if k not in seen:
+                seen.add(k)
+                out.append(e)
+    return out
+
+
+def short_project(p):
+    p = (p or "").rstrip("/\\")
+    return re.split(r"[\\/]", p)[-1] or p or "?"
+
+
+def rel_time(ts, now=None):
+    d = (now if now is not None else time.time()) - ts
+    if d < 60:
+        return "just now"
+    if d < 3600:
+        return "%dm ago" % (d // 60)
+    if d < 86400:
+        return "%dh ago" % (d // 3600)
+    if d < 2 * 86400:
+        return "yesterday"
+    return "%dd ago" % (d // 86400)
+
+
+# ---------------------------------------------------------------- hide list (never touches Claude Code's files)
+def hidden_path(environ=os.environ, win=IS_WIN):
+    if win:
+        return os.path.join(environ.get("APPDATA") or os.path.join(environ.get("USERPROFILE") or os.path.expanduser("~"),
+                            "AppData", "Roaming"), "ccpaste", "hidden.json")
+    base = environ.get("XDG_CONFIG_HOME") or os.path.join(environ.get("HOME") or os.path.expanduser("~"), ".config")
+    return os.path.join(base, "ccpaste", "hidden.json")
+
+
+def item_hide_key(sid, kind, num):
+    return "%s:%s:%s" % (sid, kind, num)
+
+
+class HideStore:
+    """ccpaste's own hide list: {"version":1,"sessions":[sid],"items":["<sid>:img:<n>","<sid>:txt:<id>"],
+    "auto_hide_days":null}. Atomic writes; a missing or corrupt file is treated as empty (a corrupt one is kept as
+    .bak). Sessions older than auto_hide_days (json) or auto_cli (--hide-older) are hidden by computation only."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.sessions, self.items, self.auto_days, self.auto_cli = set(), set(), None, None
+
+    def load(self):
+        self.path = self.path or hidden_path()
+        self.sessions, self.items, self.auto_days = set(), set(), None
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            return self
+        try:
+            d = json.loads(raw)
+            if not isinstance(d, dict):
+                raise ValueError("not an object")
+            self.sessions = {x for x in d.get("sessions", []) if isinstance(x, str)}
+            self.items = {x for x in d.get("items", []) if isinstance(x, str)}
+            n = d.get("auto_hide_days")
+            self.auto_days = n if isinstance(n, (int, float)) and not isinstance(n, bool) and n > 0 else None
+        except (ValueError, TypeError, AttributeError):
+            self.sessions, self.items, self.auto_days = set(), set(), None
+            try:
+                import shutil
+                shutil.copyfile(self.path, self.path + ".bak")
+            except OSError:
+                pass
+        return self
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = "%s.tmp.%d" % (self.path, os.getpid())
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(version=1, sessions=sorted(self.sessions), items=sorted(self.items),
+                               auto_hide_days=self.auto_days), f, indent=1)
+            os.replace(tmp, self.path)
+            return True
+        except OSError:
+            return False
+
+    def days(self):
+        return self.auto_cli if self.auto_cli is not None else self.auto_days
+
+    def session_hidden(self, sid, ts, now=None):
+        return sid in self.sessions or self.session_auto(ts, now)
+
+    def session_auto(self, ts, now=None):
+        d = self.days()
+        return bool(d) and ts > 0 and (time.time() if now is None else now) - ts > d * 86400
+
+    def item_hidden(self, sid, kind, num):
+        return item_hide_key(sid, kind, num) in self.items
+
+    def toggle_session(self, sid):
+        """-> True if now hidden"""
+        self.sessions.symmetric_difference_update({sid})
+        self.save()
+        return sid in self.sessions
+
+    def toggle_item(self, sid, kind, num):
+        self.items.symmetric_difference_update({item_hide_key(sid, kind, num)})
+        self.save()
+        return item_hide_key(sid, kind, num) in self.items
+
+
+HIDE = HideStore()
+
+
+def build_sessions(include_empty=False, always=(), show_hidden=False):
+    """-> list of dict(sid, proj, ts, nimg, ntxt, prompt), newest activity first.
+    Sessions without any pasted image/text are dropped unless include_empty."""
+    S = {}
+
+    def get(sid):
+        return S.setdefault(sid, dict(sid=sid, proj="", ts=0.0, nimg=0, ntxt=0, prompt="", first_ts=None, txt_ids=set()))
+    try:
+        slugs = os.listdir(TMP_ROOT)
+    except OSError:
+        slugs = []
+    for slug in slugs:
+        base = os.path.join(TMP_ROOT, slug)
+        try:
+            sids = os.listdir(base)
+        except OSError:
+            continue
+        for sid in sids:
+            d = os.path.join(base, sid, "images")
+            try:
+                names = os.listdir(d)
+                ts = os.stat(d).st_mtime
+            except OSError:
+                continue
+            e = get(sid)
+            e["proj"] = e["proj"] or (slug.split("-")[-1] or slug)
+            for fn in names:
+                mm = re.fullmatch(r"(\d+)\.[A-Za-z0-9]+", fn)
+                if mm:
+                    if not show_hidden and HIDE.item_hidden(sid, "img", int(mm.group(1))):
+                        continue
+                    e["nimg"] += 1
+                    try:
+                        ts = max(ts, os.stat(os.path.join(d, fn)).st_mtime)
+                    except OSError:
+                        pass
+            e["ts"] = max(e["ts"], ts)
+    for h in read_history():
+        e = get(h["sessionId"])
+        t = (h.get("timestamp") or 0) / 1000.0
+        if t >= e["ts"]:
+            e["ts"] = t
+        if h.get("project"):
+            e["proj"] = short_project(h["project"])
+        if e["first_ts"] is None or t < e["first_ts"]:
+            e["first_ts"], e["prompt"] = t, h.get("display") or ""
+        pc = h.get("pastedContents")
+        if isinstance(pc, dict):
+            for k, v in pc.items():
+                if isinstance(v, dict) and v.get("type") == "text" and paste_available(v, h.get("_dir")):
+                    if not show_hidden and HIDE.item_hidden(h["sessionId"], "txt", str(v.get("id", k))):
+                        continue
+                    e["txt_ids"].add(str(v.get("id", k)))
+    out = []
+    for e in S.values():
+        e["ntxt"] = len(e.pop("txt_ids"))
+        e.pop("first_ts")
+        e["prompt"] = " ".join(clean(e["prompt"]).split())
+        e["hidden"] = HIDE.session_hidden(e["sid"], e["ts"])
+        e["auto_hidden"] = e["hidden"] and e["sid"] not in HIDE.sessions
+        if e["hidden"] and not show_hidden and e["sid"] not in always:
+            continue
+        if include_empty or e["nimg"] + e["ntxt"] > 0 or e["sid"] in always:
+            e["title"] = session_title(e["sid"], e["prompt"])
+            out.append(e)
+    out.sort(key=lambda e: -e["ts"])
+    return out
+
+
+_title_state = {}     # transcript path -> dict(off, ai, custom)
+_title_path = {}      # sid -> transcript path
+
+
+def transcript_path(sid):
+    p = _title_path.get(sid)
+    if p and os.path.exists(p):
+        return p
+    for d in config_dirs():
+        root = os.path.join(d, "projects")
+        try:
+            for slug in os.listdir(root):
+                q = os.path.join(root, slug, sid + ".jsonl")
+                if os.path.isfile(q):
+                    _title_path[sid] = q
+                    return q
+        except OSError:
+            continue
+    return None
+
+
+def read_titles(path):
+    """(ai_title, custom_title) of a transcript. Incremental: only bytes appended since the last call are read;
+    a shrunk file is re-read from the start. Only title fields are ever extracted."""
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return "", ""
+    st = _title_state.setdefault(path, dict(off=0, ai="", custom=""))
+    if size < st["off"]:
+        st.update(off=0, ai="", custom="")
+    if size > st["off"]:
+        try:
+            with open(path, "rb") as f:
+                f.seek(st["off"])
+                chunk = f.read(size - st["off"])
+        except OSError:
+            return st["ai"], st["custom"]
+        end = chunk.rfind(b"\n") + 1            # ignore a partially written last line
+        for line in chunk[:end].split(b"\n"):
+            if b'-title"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") == "ai-title" and isinstance(d.get("aiTitle"), str):
+                st["ai"] = d["aiTitle"]
+            elif d.get("type") == "custom-title" and isinstance(d.get("customTitle"), str):
+                st["custom"] = d["customTitle"]
+        st["off"] += end
+    return st["ai"], st["custom"]
+
+
+def session_title(sid, prompt=""):
+    """custom-title > last ai-title > first prompt snippet > (untitled)."""
+    p = transcript_path(sid)
+    ai, custom = read_titles(p) if p else ("", "")
+    t = custom or ai or " ".join(clean(prompt).split())[:80]
+    return " ".join(clean(t).split()) or "(untitled)"
+
+
+def match_sessions(prefix=None):
+    """-> [(sid, ts, proj)] newest first, including sessions with no pastes (for -s)."""
+    return [(e["sid"], e["ts"], e["proj"]) for e in build_sessions(True, show_hidden=True) if not prefix or e["sid"].startswith(prefix)]
+
+
+def pick_session(prefix=None):
+    m = match_sessions(prefix)
+    return (m[0][0], m[0][2]) if m else (None, "")
+
+
+def image_dir(sid):
+    try:
+        for slug in os.listdir(TMP_ROOT):
+            d = os.path.join(TMP_ROOT, slug, sid, "images")
+            if os.path.isdir(d):
+                return d
+    except OSError:
+        pass
+    return None
+
+
+class Item:
+    def __init__(self, kind, num, path=None, text=None, sig=None, sid="", ts=0.0):
+        self.kind, self.num, self.path, self.text, self.sig, self.sid, self.ts = kind, num, path, text, sig, sid, ts
+        self.hidden = False
+
+    @property
+    def key(self):
+        return (self.sid, self.kind, self.num)
+
+    @property
+    def label(self):
+        return ("#%d" if self.kind == "img" else "T#%d") % self.num
+
+    def dlabel(self, with_sid=False):
+        return (self.sid[:4] + " " if with_sid else "") + self.label
+
+    @property
+    def nlines(self):
+        return (self.text or "").count("\n") + 1
+
+
+_text_cache = {}
+
+
+def paste_cache_path(v, cfg=None):
+    """path of the paste-cache file holding this paste's text, or None (inline content / pruned)"""
+    h = v.get("contentHash") or v.get("hash")
+    if not h:
+        return None
+    for d in [cfg or ""] + [x for x in config_dirs() if x != cfg]:
+        p = os.path.join(d, "paste-cache", os.path.basename(str(h)) + ".txt")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def paste_available(v, cfg=None):
+    """True when the paste's text can be shown: inline content, or its paste-cache file still exists in any config
+    dir (Claude Code prunes old cache files; such pastes cannot be recovered and are not listed)."""
+    if isinstance(v.get("content"), str):
+        return True
+    h = v.get("contentHash") or v.get("hash")
+    if not h:
+        return False
+    if (cfg, h) in _text_cache:
+        return True
+    return any(os.path.isfile(os.path.join(d, "paste-cache", os.path.basename(str(h)) + ".txt"))
+               for d in [cfg or ""] + [x for x in config_dirs() if x != cfg])
+
+
+def resolve_text(v, cfg=None):
+    if isinstance(v.get("content"), str):
+        return v["content"]
+    h = v.get("contentHash") or v.get("hash")
+    if h:
+        if (cfg, h) in _text_cache:
+            return _text_cache[(cfg, h)]
+        for d in [cfg or ""] + [x for x in config_dirs() if x != cfg]:      # hash-addressed: any dir's cache will do
+            try:
+                with open(os.path.join(d, "paste-cache", os.path.basename(str(h)) + ".txt"), encoding="utf-8", errors="replace") as f:
+                    _text_cache[(cfg, h)] = f.read()
+                    return _text_cache[(cfg, h)]
+            except OSError:
+                continue
+        return "[paste-cache entry unavailable]"
+    return "[empty]"
+
+
+def list_items(sid, show_hidden=False):
+    items = {}
+    d = image_dir(sid)
+    if d:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            names = []
+        for fn in names:
+            m = re.fullmatch(r"(\d+)\.[A-Za-z0-9]+", fn)
+            if not m:
+                continue
+            p = os.path.join(d, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            it = Item("img", int(m.group(1)), path=p, sig=(st.st_mtime_ns, st.st_size), sid=sid, ts=st.st_mtime)
+            it.hidden = HIDE.item_hidden(sid, "img", it.num)
+            if it.hidden and not show_hidden:
+                continue
+            items[it.key] = it
+    for e in read_history():
+        if e["sessionId"] != sid:
+            continue
+        pc = e.get("pastedContents")
+        if not isinstance(pc, dict):
+            continue
+        for k, v in pc.items():
+            if not isinstance(v, dict) or v.get("type") != "text" or not paste_available(v, e.get("_dir")):
+                continue
+            try:
+                num = int(v.get("id", k))
+            except (TypeError, ValueError):
+                continue
+            t = resolve_text(v, e.get("_dir"))
+            it = Item("txt", num, text=t, sig=(len(t), hash(t)), sid=sid, ts=(e.get("timestamp") or 0) / 1000.0)
+            it.path = paste_cache_path(v, e.get("_dir")) or os.path.join(e.get("_dir") or "", "history.jsonl")
+            it.hidden = HIDE.item_hidden(sid, "txt", it.num)
+            if it.hidden and not show_hidden:
+                items.pop(it.key, None)
+                continue
+            items[it.key] = it
+    return sorted(items.values(), key=lambda i: (i.num, i.kind != "img"))
+
+
+def list_items_all(sessions=None, show_hidden=False):
+    """Items of every session ordered by time, newest last."""
+    out = []
+    for e in (sessions if sessions is not None else build_sessions(show_hidden=show_hidden)):
+        out += list_items(e["sid"], show_hidden)
+    out.sort(key=lambda i: (i.ts, i.num))
+    return out
+
+
+# ---------------------------------------------------------------- text helpers
+def cwidth(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def fit(s, w):
+    out, n = [], 0
+    for ch in s:
+        c = cwidth(ch)
+        if n + c > w:
+            break
+        out.append(ch)
+        n += c
+    return "".join(out) + " " * (w - n)
+
+
+def fit_left(s, w):
+    """Fit to w display columns, truncating from the LEFT with an ellipsis (for paths)."""
+    tot = sum(cwidth(ch) for ch in s)
+    if tot <= w:
+        return s + " " * (w - tot)
+    out, n = [], 1
+    for ch in reversed(s):
+        c = cwidth(ch)
+        if n + c > w:
+            break
+        out.append(ch)
+        n += c
+    return "\u2026" + "".join(reversed(out)) + " " * (w - n)
+
+
+def osc52(text):
+    import base64
+    return "\x1b]52;c;%s\x07" % base64.b64encode(text.encode("utf-8")).decode()
+
+
+def clean(s):
+    return "".join(ch if ch == "\n" or ch >= " " and ch != "\x7f" and not "\x80" <= ch <= "\x9f" else " " for ch in s.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    "))
+
+
+def dwidth(ch):
+    """display columns of one source char (tab = 4, control chars show as one space)"""
+    if ch == "\t":
+        return 4
+    if ch < " " or ch == "\x7f" or "\x80" <= ch <= "\x9f":
+        return 1
+    return cwidth(ch)
+
+
+def dexpand(ch):
+    if ch == "\t":
+        return "    "
+    if ch < " " or ch == "\x7f" or "\x80" <= ch <= "\x9f":
+        return " "
+    return ch
+
+
+def source_lines(text):
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def wrap_spans(text, width):
+    """Visual lines of text as (display string, source line index, start, end) so a selection can be mapped back to
+    the ORIGINAL text (soft wraps add no newline, tabs stay tabs)."""
+    width = max(1, width)
+    out = []
+    for li, raw in enumerate(source_lines(text)):
+        s0, n, cur = 0, 0, []
+        for i, ch in enumerate(raw):
+            w = dwidth(ch)
+            if n + w > width and cur:
+                out.append(("".join(cur), li, s0, i))
+                s0, n, cur = i, 0, []
+            cur.append(dexpand(ch))
+            n += w
+        out.append(("".join(cur), li, s0, len(raw)))
+    return out
+
+
+def wrap_text(text, width):
+    return [d for d, _, _, _ in wrap_spans(text, width)]
+
+
+def orig_slice(seg, cs, ce):
+    """chars of seg whose display columns overlap cs..ce (inclusive; ce None = to the end)"""
+    acc, res, prev_in = 0, [], False
+    for ch in seg:
+        w = dwidth(ch)
+        inc = (acc + w > cs or (w == 0 and prev_in)) and (ce is None or acc <= ce)
+        if inc:
+            res.append(ch)
+        prev_in = inc
+        acc += w
+    return "".join(res)
+
+
+def selection_text_src(text, width, a, b):
+    """Selected text sliced from the original `text` (visual rows/cols a..b inclusive, wrapped at width)."""
+    spans, src = wrap_spans(text, width), source_lines(text)
+    (r0, c0), (r1, c1) = sorted([a, b])
+    out, prev_li = [], None
+    for r in range(max(0, r0), min(r1, len(spans) - 1) + 1):
+        _, li, s0, e0 = spans[r]
+        piece = orig_slice(src[li][s0:e0], c0 if r == r0 else 0, c1 if r == r1 else None)
+        if prev_li is not None:
+            out.append("\n" if li != prev_li else "")
+        out.append(piece)
+        prev_li = li
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- sixel
+_TABLES = None
+_RUN = re.compile(rb"(.)\1{3,}", re.S)
+
+
+def _tables():
+    global _TABLES
+    if _TABLES is None:
+        _TABLES = []
+        for c in range(256):
+            row = []
+            for i in range(6):
+                t = bytearray(256)
+                t[c] = 1 << i
+                row.append(bytes(t))
+            _TABLES.append(row)
+    return _TABLES
+
+
+def _rle(m):
+    return b"!%d%s" % (len(m.group(0)), m.group(1))
+
+
+def encode_sixel(img):
+    """PIL image (RGB, height multiple of 6 preferred) -> sixel bytes. Palette quantised to <=256 colours
+    (median cut); rows of one 6-px band are merged per colour."""
+    from PIL import Image
+    img = img.convert("RGB")
+    w, h = img.size
+    if w == 0 or h == 0:
+        raise ValueError("empty image")
+    q = img.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    pal = q.getpalette() or []
+    data = q.tobytes()
+    tabs = _tables()
+    k63 = int.from_bytes(b"?" * w, "big")
+    out = [b"\x1bP9;1q\"1;1;%d;%d" % (w, h)]
+    used = sorted(set(data))
+    for c in used:
+        r, g, b = pal[c * 3:c * 3 + 3]
+        out.append(b"#%d;2;%d;%d;%d" % (c, r * 100 // 255, g * 100 // 255, b * 100 // 255))
+    for y0 in range(0, h, 6):
+        rows = [data[y * w:(y + 1) * w] for y in range(y0, min(y0 + 6, h))]
+        present = set()
+        for r in rows:
+            present.update(r)
+        for c in sorted(present):
+            tb = tabs[c]
+            acc = 0
+            for i, r in enumerate(rows):
+                acc |= int.from_bytes(r.translate(tb[i]), "big")
+            line = (acc + k63).to_bytes(w, "big").rstrip(b"?")
+            if not line:
+                continue
+            out.append(b"#%d" % c + _RUN.sub(_rle, line) + b"$")
+        out.append(b"-")
+    out.append(b"\x1b\\")
+    return b"".join(out)
+
+
+def load_image(path):
+    from PIL import Image, ImageOps
+    im = Image.open(path)
+    im.load()
+    im = ImageOps.exif_transpose(im)
+    if im.mode in ("RGBA", "LA", "P", "PA"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGBA", im.size, (0, 0, 0, 255))
+        im = Image.alpha_composite(bg, im)
+    return im.convert("RGB")
+
+
+def fit_pixels(iw, ih, bw, bh):
+    """Fit iw x ih into bw x bh preserving aspect ratio, no upscaling (sixel raster height may be any value)."""
+    s = min(bw / iw, bh / ih, 1.0)
+    return max(1, int(iw * s)), max(1, int(ih * s))
+
+
+def render_thumb(path, bw, bh, cw_, ch_):
+    """Decode + resize + sixel-encode one image. Never raises: returns (data|None, cells_w, cells_h, info)."""
+    try:
+        from PIL import Image
+        im = load_image(path)
+        iw, ih = im.size
+        w, h = fit_pixels(iw, ih, bw, bh)
+        if (w, h) != im.size:
+            im = im.resize((w, h), Image.Resampling.LANCZOS if iw * ih < 4_000_000 else Image.Resampling.BILINEAR,
+                           reducing_gap=2.0)
+        return (encode_sixel(im), -(-w // cw_), -(-h // ch_), (iw, ih))
+    except Exception as e:  # decode failure -> placeholder
+        return (None, 0, 0, str(e)[:60] or e.__class__.__name__)
+
+
+class Worker:
+    """Background decode/encode queue. Key = (path, sig, bw, bh). Lowest prio number first; stale jobs can be
+    dropped with keep(). The UI thread never waits on it: get() returns None until the job is done."""
+
+    def __init__(self, notify=None, max_bytes=64 << 20, fn=render_thumb):
+        self.cond = threading.Condition()
+        self.pending, self.cache, self.done = {}, collections.OrderedDict(), []
+        self.max_bytes, self.notify, self.fn, self.seq, self.thread = max_bytes, notify, fn, 0, None
+        self.log = collections.deque(maxlen=256)   # completion order (tests)
+        self.inflight, self.protect, self.cbytes, self.error = None, set(), 0, ""
+
+    def get(self, key):
+        with self.cond:
+            v = self.cache.get(key)
+            if v is not None:
+                self.cache.move_to_end(key)
+            return v
+
+    def request(self, key, args, prio):
+        with self.cond:
+            if key in self.cache or key == self.inflight:
+                return
+            if key in self.pending:
+                self.pending[key][0] = min(self.pending[key][0], prio)
+            else:
+                self.seq += 1
+                self.pending[key] = [prio, self.seq, args]
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+            self.cond.notify()
+
+    def keep(self, keys):
+        """Drop queued jobs not in keys; cached entries in keys are never evicted (they are on screen)."""
+        with self.cond:
+            self.protect = set(keys)
+            for k in [k for k in self.pending if k not in keys]:
+                del self.pending[k]
+
+    def take_done(self):
+        with self.cond:
+            d, self.done = set(self.done), []
+            return d
+
+    @staticmethod
+    def _size(v):
+        return (len(v[0]) if v and v[0] else 0) + 200
+
+    def _run(self):
+        while True:
+            with self.cond:
+                while not self.pending:
+                    self.cond.wait()
+                key = min(self.pending, key=lambda k: self.pending[k][:2])
+                args = self.pending.pop(key)[2]
+                self.inflight = key
+            try:
+                v = self.fn(*args)
+            except BaseException as e:           # never let the thread die silently
+                v = (None, 0, 0, "worker error: %s" % (str(e)[:50] or e.__class__.__name__))
+                self.error = v[3]
+            with self.cond:
+                self.inflight = None
+                self.cache[key] = v
+                self.cbytes += self._size(v)
+                for k in list(self.cache):
+                    if self.cbytes <= self.max_bytes:
+                        break
+                    if k not in self.protect and k != key:
+                        self.cbytes -= self._size(self.cache.pop(k))
+                self.done.append(key)
+                self.log.append(key)
+            if self.notify is not None:
+                try:
+                    self.notify()
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------- layout
+def tw_for(cols):
+    """Width-aware thumbnail cell: as many >=16-col cells as fit, stretched (up to 24) to use the pane width."""
+    per = max(1, cols // TWMIN)
+    return per, max(8, min(cols // per, TWMAX))
+
+
+def layout(cols, rows, n, sel, first_row=0):
+    per_row, tw = tw_for(cols)
+    total = max(1, -(-n // per_row))
+    strip_rows = max(1, min(total, (rows // 3) // TH))
+    sel_row = (sel // per_row) if n else 0
+    first_row = max(0, min(first_row, total - strip_rows))
+    if sel_row < first_row:
+        first_row = sel_row
+    elif sel_row >= first_row + strip_rows:
+        first_row = sel_row - strip_rows + 1
+    strip_top = 1
+    sep = strip_top + strip_rows * TH
+    prev_top = sep + 1
+    body_top = prev_top + 2                      # prev_top: info line, prev_top+1: path line
+    return dict(per_row=per_row, tw=tw, total=total, strip_rows=strip_rows, first_row=first_row, strip_top=strip_top,
+                sep=sep, prev_top=prev_top, prev_h=max(1, rows - prev_top - 1), body_top=body_top,
+                body_h=max(0, rows - body_top - 1), footer=rows - 1, cols=cols, rows=rows)
+
+
+def cell_pos(L, i):
+    r = i // L["per_row"] - L["first_row"]
+    if r < 0 or r >= L["strip_rows"]:
+        return None
+    return L["strip_top"] + r * TH, (i % L["per_row"]) * L["tw"]
+
+
+def list_geom(cols, rows):
+    """Session list geometry: (row height, visible rows). Falls back to text-only rows on small panes."""
+    rh = RH if (rows >= RH + 3 and cols >= 30) else 1
+    return rh, max(1, (rows - 2) // rh)
+
+
+# ---------------------------------------------------------------- platform layer
+MOUSE_ON = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1000h\x1b[?1002h\x1b[?1006h"   # reset stale modes, then set
+MOUSE_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l"
+ENTER_SEQ = "\x1b[?1049h\x1b[?25l" + MOUSE_ON
+LEAVE_SEQ = "\x1b[0m" + MOUSE_OFF + "\x1b[?25h\x1b[?1049l"
+
+# Windows console mode bits (input / output handles)
+W_PROCESSED_IN, W_LINE, W_ECHO, W_WINDOW, W_MOUSE, W_QUICK, W_EXT, W_VTIN = 0x1, 0x2, 0x4, 0x8, 0x10, 0x40, 0x80, 0x200
+W_OUT_PROCESSED, W_OUT_VT = 0x1, 0x4
+
+
+def win_input_mode(old, vt=True):
+    """Raw input: no processed/line/echo, QUICK_EDIT off (needs EXTENDED_FLAGS) so mouse reaches the app.
+    VT mode delivers keys and SGR mouse as escape sequences; the fallback uses native mouse records."""
+    m = old & ~(W_PROCESSED_IN | W_LINE | W_ECHO | W_QUICK | W_MOUSE)
+    m |= W_EXT | W_WINDOW
+    return m | (W_VTIN if vt else W_MOUSE)
+
+
+def win_output_mode(old):
+    return old | W_OUT_PROCESSED | W_OUT_VT
+
+
+def winsize(fd=1):
+    """(rows, cols, xpixels, ypixels); pixels are 0 where the platform does not report them."""
+    if IS_WIN:
+        try:
+            c, r = os.get_terminal_size(fd)
+            return r or 24, c or 80, 0, 0
+        except OSError:
+            return 24, 80, 0, 0
+    try:
+        r, c, xp, yp = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        return r or 24, c or 80, xp, yp
+    except OSError:
+        return 24, 80, 0, 0
+
+
+def out_write(data):
+    if isinstance(data, str):
+        data = data.encode("utf-8", "replace")
+    while data:
+        try:
+            n = os.write(1, data)
+        except BlockingIOError:
+            time.sleep(0.005)
+            continue
+        data = data[n:]
+
+
+class BaseTerm:
+    """Platform layer: owns raw mode, the input reader thread and an idempotent restore. All input, resize,
+    quit and worker-completion events arrive on one queue of (kind, payload)."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self.restored = True
+        self.lock = threading.Lock()
+
+    def write(self, data):
+        out_write(data)
+
+    def _reader(self):
+        try:
+            self._read_loop()
+        except Exception:                          # never leave an unquittable app: tell the main loop
+            import traceback
+            self.q.put(("fatal", traceback.format_exc()))
+
+    def enter(self):
+        self.restored = False
+        self._enter()
+
+    def restore(self):
+        with self.lock:
+            if self.restored:
+                return
+            self.restored = True
+        try:
+            self.write(LEAVE_SEQ)
+        except OSError:
+            pass
+        self._restore()
+
+
+class UnixTerm(BaseTerm):
+    def _enter(self):
+        self.old = termios.tcgetattr(0)
+        tty.setraw(0)
+        self.write(ENTER_SEQ)
+        if hasattr(signal, "SIGWINCH"):
+            signal.signal(signal.SIGWINCH, lambda *_: self.q.put(("resize", None)))
+        for name in ("SIGTERM", "SIGHUP"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), lambda *_: self.q.put(("quit", None)))
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _read_loop(self):
+        import codecs
+        dec = codecs.getincrementaldecoder("utf-8")("ignore")
+        while True:
+            try:
+                b = os.read(0, 4096)
+            except OSError:
+                b = b""
+            if not b:
+                self.q.put(("eof", None))
+                return
+            s = dec.decode(b)
+            if s:
+                self.q.put(("in", s))
+
+    def _restore(self):
+        try:
+            termios.tcsetattr(0, termios.TCSAFLUSH, self.old)      # discard queued mouse reports
+        except (termios.error, OSError):
+            pass
+
+
+class WinTerm(BaseTerm):
+    """Native Windows console (Windows Terminal). UNTESTED on real hardware: written from the Win32 console
+    API docs; the pure mode math is unit tested."""
+
+    def _enter(self):
+        import ctypes
+        from ctypes import wintypes
+        k = self.k = ctypes.windll.kernel32
+        k.GetStdHandle.restype = ctypes.c_void_p
+        k.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+        k.SetConsoleMode.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        self.hin, self.hout = k.GetStdHandle(-10), k.GetStdHandle(-11)
+        old_in, old_out = wintypes.DWORD(), wintypes.DWORD()
+        k.GetConsoleMode(self.hin, ctypes.byref(old_in))
+        k.GetConsoleMode(self.hout, ctypes.byref(old_out))
+        self.old_in, self.old_out = old_in.value, old_out.value
+        self.old_cp = k.GetConsoleOutputCP()
+        k.SetConsoleOutputCP(65001)
+        k.SetConsoleMode(self.hout, win_output_mode(self.old_out))
+        self.vt = True
+        k.SetConsoleMode(self.hin, win_input_mode(self.old_in, True))
+        cur = wintypes.DWORD()
+        k.GetConsoleMode(self.hin, ctypes.byref(cur))
+        if not cur.value & W_VTIN:                     # the bit did not stick: native records instead
+            self.vt = False
+            k.SetConsoleMode(self.hin, win_input_mode(self.old_in, False))
+        self.write(ENTER_SEQ if self.vt else "\x1b[?1049h\x1b[?25l")
+        for name in ("SIGBREAK", "SIGTERM"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), lambda *_: self.q.put(("quit", None)))
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _read_loop(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class KeyRec(ctypes.Structure):
+            _fields_ = [("down", wintypes.BOOL), ("repeat", wintypes.WORD), ("vk", wintypes.WORD),
+                        ("scan", wintypes.WORD), ("ch", ctypes.c_wchar), ("ctrl", wintypes.DWORD)]
+
+        class MouseRec(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short), ("buttons", wintypes.DWORD),
+                        ("ctrl", wintypes.DWORD), ("flags", wintypes.DWORD)]
+
+        class SizeRec(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short)]
+
+        class Union(ctypes.Union):
+            _fields_ = [("key", KeyRec), ("mouse", MouseRec), ("size", SizeRec)]
+
+        class InputRec(ctypes.Structure):
+            _fields_ = [("type", wintypes.WORD), ("u", Union)]
+
+        k = self.k
+        k.ReadConsoleInputW.argtypes = [ctypes.c_void_p, ctypes.POINTER(InputRec), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        k.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        buf = (InputRec * 64)()
+        n = wintypes.DWORD()
+        prev_buttons = 0
+        vk_seq = {0x25: "\x1b[D", 0x26: "\x1b[A", 0x27: "\x1b[C", 0x28: "\x1b[B", 0x21: "\x1b[5~", 0x22: "\x1b[6~"}
+        while not self.restored:
+            if k.WaitForSingleObject(self.hin, 100) != 0:
+                continue
+            if not k.ReadConsoleInputW(self.hin, buf, 64, ctypes.byref(n)):
+                self.q.put(("eof", None))
+                return
+            text = []
+            for i in range(n.value):
+                rec = buf[i]
+                if rec.type == 1 and rec.u.key.down:               # KEY_EVENT: VT mode carries the bytes as chars
+                    ch = rec.u.key.ch
+                    if ch != "\0":
+                        text.append(ch * max(1, rec.u.key.repeat))
+                    elif not self.vt and rec.u.key.vk in vk_seq:
+                        text.append(vk_seq[rec.u.key.vk])
+                elif rec.type == 2 and not self.vt:                # MOUSE_EVENT fallback -> synthesised SGR
+                    m = rec.u.mouse
+                    x, y = m.x + 1, m.y + 1
+                    if m.flags & 0x4:
+                        cb = 64 if ctypes.c_short(m.buttons >> 16).value > 0 else 65
+                        text.append("\x1b[<%d;%d;%dM" % (cb, x, y))
+                    else:
+                        left, was = m.buttons & 1, prev_buttons & 1
+                        if left and not was:
+                            text.append("\x1b[<0;%d;%dM" % (x, y))
+                        elif left and was and m.flags & 0x1:
+                            text.append("\x1b[<32;%d;%dM" % (x, y))
+                        elif was and not left:
+                            text.append("\x1b[<0;%d;%dm" % (x, y))
+                        prev_buttons = m.buttons
+                elif rec.type == 4:
+                    self.q.put(("resize", None))
+            if text:
+                s = "".join(text)
+                try:                                              # join UTF-16 surrogate pairs
+                    s = s.encode("utf-16", "surrogatepass").decode("utf-16")
+                except UnicodeError:
+                    pass
+                self.q.put(("in", s))
+
+    def _restore(self):
+        k = self.k
+        k.SetConsoleMode(self.hin, self.old_in)
+        k.SetConsoleMode(self.hout, self.old_out)
+        k.SetConsoleOutputCP(self.old_cp)
+
+
+def make_term():
+    return WinTerm() if IS_WIN else UnixTerm()
+
+
+def query_cell_px(term, timeout=0.3):
+    """Ask the terminal for its cell size (CSI 16t) through the input queue; other input is put back."""
+    term.write(b"\x1b[16t")
+    buf, keep, end = "", [], time.time() + timeout
+    got = None
+    while got is None and time.time() < end:
+        try:
+            kind, payload = term.q.get(timeout=max(0.0, end - time.time()))
+        except queue.Empty:
+            break
+        if kind != "in":
+            keep.append((kind, payload))
+            continue
+        buf += payload
+        m = re.search(r"\x1b\[6;(\d+);(\d+)t", buf)
+        if m:
+            got = (int(m.group(2)), int(m.group(1)))
+            buf = buf[:m.start()] + buf[m.end():]
+    for ev in keep:
+        term.q.put(ev)
+    if buf:
+        term.q.put(("in", buf))
+    return got
+
+
+# ---------------------------------------------------------------- input parsing (keys + SGR mouse)
+SGR_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+SGR_PARTIAL = re.compile(r"\x1b\[<[\d;]*$")
+CSI_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left", "5~": "pgup", "6~": "pgdn",
+            "H": "g", "F": "G", "1~": "g", "4~": "G"}
+
+
+def decode_sgr(cb, x, y, final):
+    """xterm SGR mouse decode: button=(cb&3)|((cb&0xC0)>>4), drag=cb&32, 4..7 = wheel; x,y become 0-based."""
+    btn = (cb & 3) | ((cb & 0xC0) >> 4)
+    drag = bool(cb & 32)
+    ev = dict(x=x - 1, y=y - 1, shift=bool(cb & 4), alt=bool(cb & 8), ctrl=bool(cb & 16), btn=btn & 3)
+    if btn >= 8:
+        ev["kind"] = "other"                       # back/forward and other extended buttons are ignored
+    elif btn >= 4 and not drag:
+        ev.update(kind="scroll", dir={4: "up", 5: "down", 6: "left", 7: "right"}.get(btn, "up"))
+    elif final == "m":
+        ev["kind"] = "up"
+    elif drag:
+        ev["kind"] = "drag" if btn < 3 else "move"
+    elif btn < 3:
+        ev["kind"] = "down"
+    else:
+        ev["kind"] = "up"
+    return ev
+
+
+class InputParser:
+    """Turns raw text into ("key", name) / ("mouse", dict) events. Split sequences are buffered; a lone ESC (or
+    an unfinished sequence) is held HOLD_ESC / HOLD_SEQ seconds before being treated as the Esc key / dropped."""
+    HOLD_ESC, HOLD_SEQ = 0.1, 0.5
+
+    def __init__(self):
+        self.buf, self.since = "", 0.0
+
+    def feed(self, text, now=None):
+        now = time.time() if now is None else now
+        s = self.buf + text
+        out, i = [], 0
+        while i < len(s):
+            ch = s[i]
+            if ch != ESC:
+                out.append(("key", "ctrl-c" if ch == "\x03" else ch))
+                i += 1
+                continue
+            rest = s[i:]
+            if len(rest) == 1:
+                break
+            n = rest[1]
+            if n == "[":
+                if len(rest) == 2:
+                    break
+                if rest[2] == "<":
+                    m = SGR_RE.match(rest)
+                    if m:
+                        out.append(("mouse", decode_sgr(int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4))))
+                        i += m.end()
+                        continue
+                    if SGR_PARTIAL.match(rest):
+                        break
+                    i += 3
+                    continue
+                j = 2
+                while j < len(rest) and not ("@" <= rest[j] <= "~"):
+                    j += 1
+                if j >= len(rest):
+                    break
+                out.append(("key", CSI_KEYS.get(rest[2:j + 1], "?")))
+                i += j + 1
+                continue
+            if n == "O":
+                if len(rest) == 2:
+                    break
+                out.append(("key", CSI_KEYS.get(rest[2], "?")))
+                i += 3
+                continue
+            out.append(("key", ESC))
+            i += 1
+        rem = s[i:]
+        if rem and (rem != self.buf or not self.buf):
+            self.since = now
+        self.buf = rem
+        return out
+
+    def flush(self, now=None):
+        now = time.time() if now is None else now
+        if not self.buf:
+            return []
+        if self.buf == ESC and now - self.since >= self.HOLD_ESC:
+            self.buf = ""
+            return [("key", ESC)]
+        if now - self.since >= self.HOLD_SEQ:
+            self.buf = ""
+        return []
+
+
+def parse_keys(buf):
+    p = InputParser()
+    ev = p.feed(buf, 0.0) + p.flush(1e9)
+    return [v for t, v in ev if t == "key"]
+
+
+# ---------------------------------------------------------------- clipboard
+def is_wsl(environ=os.environ, proc_version=None):
+    if environ.get("WSL_DISTRO_NAME") or environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in (proc_version if proc_version is not None else f.read()).lower()
+    except OSError:
+        return False
+
+
+TOAST_SECS = 1.5         # long enough to read a 2-3 word message, short enough not to cover the footer for long
+DBLCLICK_S = 0.40        # double-click window; a little generous because the pointer is read from terminal events
+REPAINT_MIN_S = 0.025    # at most ~40 selection repaints per second while dragging
+AUTOSCROLL_MAX_LINES = 8
+
+
+def autoscroll_step(dist, body_h):
+    """Lines to scroll per tick when the pointer is `dist` rows beyond the text area: grows linearly with distance
+    (1 row out = 2 lines) and is capped at half the viewport so one tick never skips a whole page."""
+    return max(2, min(AUTOSCROLL_MAX_LINES, 1 + dist, max(2, body_h // 2)))
+
+
+# Local clipboard tools, tried in this order when the session is local. Each row: (backend name, env var that must be
+# set for it to make sense, argv). Wayland is listed first because a Wayland session usually also exports DISPLAY
+# (XWayland), and xclip/xsel would then write to the X bridge rather than the native clipboard.
+LOCAL_CLIP_TOOLS = (
+    ("wl-copy", "WAYLAND_DISPLAY", ["wl-copy", "--type", "text/plain;charset=utf-8"]),
+    ("xclip", "DISPLAY", ["xclip", "-selection", "clipboard", "-in"]),
+    ("xsel", "DISPLAY", ["xsel", "--clipboard", "--input"]),
+)
+
+
+def clipboard_backend(environ, platform, which, wsl=False):
+    """-> (name, argv). A local tool is used only when the clipboard it would write to is the one the user is looking
+    at. Over SSH it is the remote machine's, and under WSL the Linux-side X/Wayland clipboard is not the Windows one,
+    so there the terminal's OSC 52 handler is the only route that lands in the right place. OSC 52 is also the
+    fallback when no tool is installed."""
+    if platform == "win32":
+        return "win32", None
+    if platform == "darwin":
+        return ("pbcopy", ["pbcopy"]) if which("pbcopy") else ("osc52", None)
+    remote = wsl or any(environ.get(k) for k in ("SSH_CONNECTION", "SSH_TTY"))
+    if not remote:
+        for name, needs_env, argv in LOCAL_CLIP_TOOLS:
+            if environ.get(needs_env) and which(argv[0]):
+                return name, list(argv)
+    return "osc52", None
+
+
+def win_clipboard_set(text):
+    import ctypes
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    k.GlobalAlloc.restype = ctypes.c_void_p
+    k.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalLock.argtypes = [ctypes.c_void_p]
+    k.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k.GlobalFree.argtypes = [ctypes.c_void_p]
+    k.GetConsoleWindow.restype = ctypes.c_void_p
+    u.OpenClipboard.argtypes = [ctypes.c_void_p]
+    u.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    u.SetClipboardData.restype = ctypes.c_void_p
+    if "\0" in text:
+        return False
+    data = (text.replace("\r\n", "\n").replace("\n", "\r\n") + "\0").encode("utf-16-le")
+    if not u.OpenClipboard(k.GetConsoleWindow()):
+        return False
+    try:
+        u.EmptyClipboard()
+        h = k.GlobalAlloc(0x2, len(data))               # GMEM_MOVEABLE
+        if not h:
+            return False
+        p = k.GlobalLock(h)
+        if not p:
+            k.GlobalFree(h)
+            return False
+        ctypes.memmove(p, data, len(data))
+        k.GlobalUnlock(h)
+        if u.SetClipboardData(13, h):                     # CF_UNICODETEXT; the system owns h on success
+            return True
+        k.GlobalFree(h)
+        return False
+    finally:
+        u.CloseClipboard()
+
+
+def run_clip_tool(argv, text, timeout):
+    import subprocess
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    except OSError:
+        return False
+    try:
+        p.communicate(text.encode("utf-8"), timeout=timeout)
+        return p.returncode == 0
+    except Exception:                                # timeout (stuck tool) or broken pipe
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return False
+
+
+def run_tool(argv, data, timeout):
+    """Run argv (no shell) feeding it `data` bytes on stdin; True on exit 0. A stuck tool is killed at the timeout."""
+    import subprocess
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    except OSError:
+        return False
+    try:
+        p.communicate(data, timeout=timeout)
+        return p.returncode == 0
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return "timeout"                              # the copy may still land: callers must not add a fallback
+    except Exception:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return False
+
+
+def ps_quote(s):
+    return "'" + "".join(c * 2 if c in "'\u2018\u2019\u201a\u201b" else c for c in s) + "'"   # PowerShell treats these as quotes
+
+
+def image_clip_plan(path, platform, wsl, environ, which, win_path=None):
+    """How to put an IMAGE FILE on the clipboard. -> dict(name, argv, stdin_png) or None. argv lists only (no shell)."""
+    if platform == "win32":
+        return dict(name="win32", argv=None, stdin_png=False)
+    if platform == "darwin":
+        if not which("osascript"):
+            return None
+        p = path.replace("\\", "\\\\").replace('"', '\\"')
+        return dict(name="osascript", stdin_png=False,
+                    argv=["osascript", "-e", 'set the clipboard to (read (POSIX file "%s") as \u00abclass PNGf\u00bb)' % p])
+    if wsl:
+        import base64
+        script = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
+                  "$i=[Drawing.Image]::FromFile(%s); [Windows.Forms.Clipboard]::SetImage($i)" % ps_quote(win_path or path))
+        enc = base64.b64encode(script.encode("utf-16-le")).decode()
+        return dict(name="powershell", stdin_png=False,
+                    argv=["powershell.exe", "-NoProfile", "-STA", "-EncodedCommand", enc])
+    if environ.get("WAYLAND_DISPLAY") and which("wl-copy"):
+        return dict(name="wl-copy", argv=["wl-copy", "--type", "image/png"], stdin_png=True)
+    if environ.get("DISPLAY") and which("xclip"):
+        return dict(name="xclip", argv=["xclip", "-selection", "clipboard", "-t", "image/png", "-i"], stdin_png=True)
+    return None
+
+
+def png_bytes(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return raw
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.open(path).convert("RGBA").save(buf, "PNG")
+    return buf.getvalue()
+
+
+def win_clipboard_set_image(path):
+    """CF_DIB (BMP without its 14-byte file header) plus a registered "PNG" format. Untested on Windows."""
+    import ctypes, io
+    from PIL import Image
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    k.GlobalAlloc.restype = ctypes.c_void_p
+    k.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalLock.argtypes = [ctypes.c_void_p]
+    k.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k.GlobalFree.argtypes = [ctypes.c_void_p]
+    k.GetConsoleWindow.restype = ctypes.c_void_p
+    u.OpenClipboard.argtypes = [ctypes.c_void_p]
+    u.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    u.SetClipboardData.restype = ctypes.c_void_p
+    im = Image.open(path)
+    im.load()
+    bmp = io.BytesIO()
+    im.convert("RGB").save(bmp, "BMP")
+    dib = bmp.getvalue()[14:]
+    png = io.BytesIO()
+    im.convert("RGBA").save(png, "PNG")
+    if not u.OpenClipboard(k.GetConsoleWindow()):
+        return False
+    try:
+        u.EmptyClipboard()
+        ok = False
+        for fmt, data in ((8, dib), (u.RegisterClipboardFormatW("PNG"), png.getvalue())):
+            h = k.GlobalAlloc(0x2, len(data))
+            p = k.GlobalLock(h) if h else None
+            if not p:
+                if h:
+                    k.GlobalFree(h)
+                continue
+            ctypes.memmove(p, data, len(data))
+            k.GlobalUnlock(h)
+            if u.SetClipboardData(fmt, h):
+                ok = ok or fmt == 8
+            else:
+                k.GlobalFree(h)
+        return ok
+    finally:
+        u.CloseClipboard()
+
+
+def copy_image_blocking(path, platform=None, environ=None, wsl=None, which=None, timeout=6.0):
+    """Put the image on the clipboard through the platform backend. True on success; False -> caller falls back
+    to copying the path; "timeout" -> the tool was killed but may still have copied: no fallback."""
+    import shutil
+    platform = platform or sys.platform
+    environ = os.environ if environ is None else environ
+    which = which or shutil.which
+    wsl = is_wsl(environ) if wsl is None else wsl
+    tmp_png = None
+    try:
+        if platform == "win32":
+            return win_clipboard_set_image(path)
+        win_path = None
+        if platform == "darwin" and not path.lower().endswith(".png"):
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.write(png_bytes(path))
+            tmp.close()
+            path = tmp_png = tmp.name
+        if wsl and platform != "darwin":
+            import subprocess
+            win_path = subprocess.run(["wslpath", "-w", path], capture_output=True, text=True, timeout=3).stdout.strip()
+            if not win_path:
+                return False
+        plan = image_clip_plan(path, platform, wsl, environ, which, win_path)
+        if not plan:
+            return False
+        data = png_bytes(path) if plan["stdin_png"] else b""
+        return run_tool(plan["argv"], data, timeout)
+    except Exception:
+        return False
+    finally:
+        if tmp_png:
+            try:
+                os.unlink(tmp_png)
+            except OSError:
+                pass
+
+
+def copy_text(text, osc_write, post=None, timeout=2.0):
+    """Copy via the native clipboard when possible, else OSC 52 (osc_write emits the escape). External tools run in
+    a daemon thread when `post` (a queue.put) is given, so a stuck tool never blocks the UI; on failure or timeout
+    ("clip_fail", text) is posted and the UI thread falls back to OSC 52. -> backend name."""
+    import shutil
+    name, argv = clipboard_backend(os.environ, sys.platform, shutil.which, is_wsl())
+    if name == "win32":
+        try:
+            if win_clipboard_set(text):
+                return name
+        except Exception:
+            pass
+    elif argv:
+        if post is not None:
+            def work():
+                if not run_clip_tool(argv, text, timeout):
+                    post(("clip_fail", text))
+            threading.Thread(target=work, daemon=True).start()
+            return name
+        if run_clip_tool(argv, text, timeout):
+            return name
+    osc_write(osc52(text))
+    return "osc52"
+
+
+def menu_geom(px, py, w, h, cols, rows):
+    """Top-left of a w x h popup opened at (px, py): flips left / up at the window edges and never covers the
+    footer (last row)."""
+    col = px if px + w <= cols - 1 else px - w + 1
+    col = max(0, min(col, cols - 1 - w))
+    row = py if py + h <= rows - 1 else py - h + 1
+    row = max(0, min(row, rows - 1 - h))
+    return row, col
+
+
+# ---------------------------------------------------------------- selection helpers (pure)
+def col_to_index(line, col):
+    acc = 0
+    for i, ch in enumerate(line):
+        w = cwidth(ch)
+        if col < acc + w:
+            return i
+        acc += w
+    return len(line)
+
+
+def index_to_col(line, idx):
+    return sum(cwidth(ch) for ch in line[:idx])
+
+
+def selection_text(lines, a, b):
+    """Text between (row, col) a and b inclusive, CJK-width aware; rows are absolute indexes into lines."""
+    (r0, c0), (r1, c1) = sorted([a, b])
+    out = []
+    for r in range(r0, r1 + 1):
+        ln = lines[r] if 0 <= r < len(lines) else ""
+        s = col_to_index(ln, c0) if r == r0 else 0
+        e = min(len(ln), col_to_index(ln, c1) + 1) if r == r1 else len(ln)
+        out.append(ln[s:e])
+    return "\n".join(out)
+
+
+def word_range(line, col):
+    """(start_col, end_col inclusive) of the word under col, or None past the end of the line."""
+    i = col_to_index(line, col)
+    if i >= len(line):
+        return None
+    isw = lambda c: c.isalnum() or c == "_"
+    kind = isw(line[i])
+    j0 = i
+    while j0 > 0 and isw(line[j0 - 1]) == kind and (kind or line[j0 - 1] == line[i]):
+        j0 -= 1
+    j1 = i
+    while j1 + 1 < len(line) and isw(line[j1 + 1]) == kind and (kind or line[j1 + 1] == line[i]):
+        j1 += 1
+    return index_to_col(line, j0), index_to_col(line, j1 + 1) - 1
+
+
+def hl_line(line, c0, c1):
+    """line with display columns c0..c1 (inclusive; None = to the end) in reverse video"""
+    i0 = col_to_index(line, c0)
+    i1 = len(line) if c1 is None else min(len(line), col_to_index(line, c1) + 1)
+    return line[:i0] + "\x1b[7m" + line[i0:i1] + "\x1b[0m" + line[i1:]
+
+
+
+ALL = "*"
+
+
+def all_entry(sessions):
+    return dict(sid=ALL, proj="all", title="★ All sessions", ts=max([e["ts"] for e in sessions], default=0.0),
+                nimg=sum(e["nimg"] for e in sessions), ntxt=sum(e["ntxt"] for e in sessions), prompt="")
+
+
+def sidebar_geom(cols, on=True):
+    """-> (sidebar width, x offset of the right pane). The divider column is the sidebar width itself.
+    Hidden (or pane too narrow): (0, 0)."""
+    if not on or cols < 60:
+        return 0, 0
+    sbw = max(22, min(42, int(cols * 0.28)))
+    return sbw, sbw + 1
+
+
+def side_row(e, sbw, now=None):
+    """The two sidebar lines of one session (each exactly sbw display columns).
+    Line 1: title, then the 8-char id right-aligned. Line 2: project - relative time - counts."""
+    cnt = "%d img / %d txt" % (e["nimg"], e["ntxt"])
+    if e["sid"] == ALL:
+        return fit(" " + e["title"], sbw), fit("   " + cnt, sbw), ""
+    idw = 8
+    l1 = fit((" \u2298 " if e.get("hidden") else " ") + e["title"], sbw - idw - 1)
+    l2 = fit(" %s · %s · %s" % (e["proj"], rel_time(e["ts"], now), cnt), sbw)
+    return l1, l2, e["sid"][:idw] + " "
+
+
+class App:
+    def __init__(self, sid=None, project="", worker=None):
+        self.pinned = bool(sid)
+        self.sel_sid = sid or None
+        self.focus = "main" if sid else "side"
+        self.show_side = True
+        self.show_hidden, self.undo_stack = False, []
+        self.clock, self.toast, self.menu, self.help, self._copy_label = time.time, None, None, False, "copied"
+        self.sid, self.project = None, project
+        self.rows, self.sfirst, self.ssig = [], 0, None
+        self.items, self.sel, self.first_row, self.text_off, self.projs = [], 0, 0, 0, {}
+        self.worker = worker or Worker()
+        self.cellpx = None
+        self.cellsrc = "fallback"
+        self.wt = bool(os.environ.get("WT_SESSION"))
+        self.sig = None
+        self.x0 = 0
+        self._drawn = False
+        self.cellscale, self.flash, self.flash_until, self.title = 1.0, "", 0.0, ""
+        self.out = []
+        self.term, self.parser, self.sfree = None, InputParser(), False
+        self.sel_state, self.last_down, self.mouse_pos, self._sel_draw = None, None, (0, 0), 0.0
+
+    # ---- output helpers
+    def w(self, s):
+        self.out.append(s if isinstance(s, bytes) else s.encode("utf-8", "replace"))
+
+    def flush(self, force=False):
+        """Overlays (toast, menu) are appended after everything else so they land on top of any Sixel."""
+        if self.menu and not self.menu_fits():                    # window shrank under an open menu
+            self.menu = None
+            self.out.append(b"\x1b[?1003l\x1b[?1002h")
+        if self.out or force:
+            if self.toast:
+                self.out.append(self.toast_bytes())
+            if self.menu:
+                self.out.append(self.menu_bytes())
+            if self.help:
+                self.out.append(self.help_bytes())
+        data = b"".join(self.out)
+        self.out = []
+        out_write(data)
+
+    def at(self, r, c):
+        return "\x1b[%d;%dH" % (r + 1, c + 1)
+
+    def atx(self, r, c):
+        """cursor position relative to the right pane"""
+        return self.at(r, c + self.x0)
+
+    def cell_px(self):
+        """Cell size in pixels. Order: CCPASTE_CELL / CSI 16t answer (self.cellpx), TIOCGWINSZ pixels, guess.
+        ioctl pixel sizes under ConPTY may include window chrome, so a terminal answer wins over it."""
+        if self.cellpx:
+            return self.cellpx
+        r, c, xp, yp = winsize()
+        if xp and yp:
+            self.cellsrc = "ioctl"
+            return max(1, xp // c), max(1, yp // r)
+        self.cellsrc = "fallback"
+        return 10, 20
+
+    def cell_px_safe(self):
+        """Cell size used to size images. A guessed (fallback) size is shrunk so an image never spills past its
+        rows even if the real cells are smaller than assumed."""
+        cw_, ch_ = self.cell_px()
+        k = self.cellscale * (0.6 if self.cellsrc == "fallback" else 1.0)
+        if k != 1.0:
+            cw_, ch_ = max(1, int(cw_ * k)), max(1, int(ch_ * k))
+        return cw_, ch_
+
+    def sixel_at(self, r, c, data):
+        """Draw a Sixel with its top-left at absolute cell (r, c); the cursor is saved and restored around it.
+        Under Windows Terminal (ConPTY) the host keeps its own model of the cursor and drops a move it believes is
+        redundant, but a Sixel payload moves the real cursor without that model noticing. So each move that matters
+        is preceded by a move to the neighbouring row, which makes the intended move a real change that must be
+        forwarded. (Needs a retest on WSL + Windows Terminal.)"""
+        if self.wt:
+            nudge = self.at(r + 1, c)
+            self.w("\x1b7" + nudge + self.at(r, c))
+            self.w(data)
+            self.w(nudge + "\x1b8")
+        else:
+            self.w("\x1b7" + self.at(r, c))
+            self.w(data)
+            self.w("\x1b8")
+
+    def blank(self, r0, r1, c0, w):
+        sp = " " * w
+        for r in range(r0, r1):
+            self.w(self.at(r, c0) + sp)
+
+    def blankx(self, r0, r1, c0, w):
+        self.blank(r0, r1, c0 + self.x0, w)
+
+    # ---- async image placements (positions are right-pane relative; draw_place adds x0)
+    def placements(self):
+        ps = []
+        if not self.items:
+            return ps
+        cw_, ch_ = self.cell_px_safe()
+        L = self.L()
+        if L["body_h"] < 2:
+            return ps
+        it = self.items[self.sel]
+        if it.kind == "img":
+            bw, bh = (L["cols"] - 1) * cw_, L["body_h"] * ch_
+            ps.append(dict(key=(it.path, it.sig, bw, bh), args=(it.path, bw, bh, cw_, ch_), kind="prev", prio=0,
+                           r=L["body_top"], c=0, w=L["cols"], h=L["body_h"]))
+        bw, bh = (L["tw"] - 2) * cw_, THUMB_ROWS * ch_
+        for i, t in enumerate(self.items):
+            p = cell_pos(L, i)
+            if p and t.kind == "img":
+                ps.append(dict(key=(t.path, t.sig, bw, bh), args=(t.path, bw, bh, cw_, ch_), kind="thumb",
+                               prio=1 + abs(i - self.sel), r=p[0] + 1, c=p[1] + 1, w=L["tw"] - 2, h=THUMB_ROWS))
+        return ps
+
+    def sync(self):
+        ps = self.placements()
+        for p in ps:
+            self.worker.request(p["key"], p["args"], p["prio"])
+        self.worker.keep({p["key"] for p in ps})
+
+    def draw_place(self, p):
+        """Cell box first: p is a box of (w x h) cells in the right pane; the sixel was sized to fit it in pixels.
+        Centre it in cells and clamp so it never leaves [x0, total_cols)."""
+        v = self.worker.get(p["key"])
+        x0 = self.x0
+        total = winsize()[1]
+        if p["kind"] == "thumb":
+            self.blank(p["r"], p["r"] + p["h"], p["c"] - 1 + x0, p["w"] + 2)
+            if v is None:
+                self.w(self.at(p["r"] + p["h"] // 2, p["c"] + x0) + "\x1b[2m" + fit("...", p["w"]) + "\x1b[0m")
+            elif v[0] is None:
+                self.w(self.at(p["r"] + p["h"] // 2, p["c"] + x0) + fit("[unreadable]", p["w"]))
+            else:
+                x = min(p["c"] + x0 + max(0, (p["w"] - v[1]) // 2), total - v[1])
+                self.sixel_at(p["r"], max(x, x0), v[0])
+        else:
+            self.blank(p["r"], p["r"] + p["h"], x0, p["w"])
+            if v is None:
+                self.w(self.at(p["r"], x0 + 1) + "loading image...")
+            elif v[0] is None:
+                self.w(self.at(p["r"], x0 + 1) + fit("cannot decode image: %s" % v[3], p["w"] - 1))
+            else:
+                x = min(x0 + max(0, (p["w"] - v[1]) // 2), total - v[1])
+                self.sixel_at(p["r"], max(x, x0), v[0])
+
+    def on_ready(self, keys):
+        hit = [p for p in self.placements() if p["key"] in keys]
+        for p in hit:
+            self.draw_place(p)
+        if hit:
+            if self.items and self.L()["body_h"] >= 2:
+                self.footer(self.L())          # footer is always drawn last so a sixel can never hide it
+            self.flush()
+
+    # ---- header / footer / sidebar
+    def header(self, cols):
+        sbw = self.x0 - 1 if self.x0 else 0
+        side_on = self.focus == "side"
+        if sbw:
+            self.w(self.at(0, 0) + ("\x1b[1;7m" if side_on else "\x1b[2;7m") + fit(" sessions", sbw) + "\x1b[0m")
+            self.w(self.at(0, sbw) + "\u2502")
+        w = cols - self.x0
+        base = "\x1b[2m" if side_on else "\x1b[1;7m"
+        if self.sid == ALL:
+            txt, idt = " \u2605 All sessions \u00b7 %d items" % len(self.items), ""
+        else:
+            txt = " %s \u00b7 %s \u00b7 %d items" % (self.title or "(untitled)", self.project, len(self.items))
+            idt = (self.sid or "")[:8] + " "
+        self.w(self.at(0, self.x0) + base + fit(txt, w - len(idt)) + "\x1b[0m" + base + "\x1b[2m" + idt + "\x1b[0m")
+
+    def divider(self, rows):
+        if not self.x0:
+            return
+        sty = "\x1b[1;36m" if self.focus == "side" else "\x1b[2m"
+        for r in range(1, rows - 1):
+            self.w(self.at(r, self.x0 - 1) + sty + "│\x1b[0m")
+
+    def draw_sidebar(self, rows):
+        if not self.x0:
+            return
+        sbw = self.x0 - 1
+        vis = max(1, (rows - 2) // 2)
+        idx = self.side_idx()
+        if not self.sfree:
+            self.sfirst = max(0, min(self.sfirst, idx))
+            if idx >= self.sfirst + vis:
+                self.sfirst = idx - vis + 1
+        self.sfirst = max(0, min(self.sfirst, max(0, len(self.rows) - vis)))
+        now = time.time()
+        self.blank(1, rows - 1, 0, sbw)
+        for k, e in enumerate(self.rows[self.sfirst:self.sfirst + vis]):
+            top = 1 + 2 * k
+            l1, l2, idt = side_row(e, sbw, now)
+            sel = self.sfirst + k == idx
+            if e.get("hidden") and not sel:
+                l1 = "\x1b[2m" + l1
+            st = ("\x1b[7m" if self.focus == "side" else "\x1b[1m") if sel else ""
+            self.w(self.at(top, 0) + st + l1 + "\x1b[0m" + st + "\x1b[2m" * (not sel) + idt + "\x1b[0m")
+            self.w(self.at(top + 1, 0) + st + ("" if sel else "\x1b[2m") + l2 + "\x1b[0m")
+        self.divider(rows)
+
+    def footer(self, L):
+        """Short contextual footer: position on the left, at most three hints and "? help" on the right."""
+        cols = L["cols"] + self.x0
+        if self.focus == "side":
+            idx, n = self.side_idx(), len(self.rows)
+            left = "session %d/%d" % (idx, n - 1) if n > 1 and idx > 0 else "all sessions"
+            right = "\u2191\u2193 session  Enter open  ? help"
+        else:
+            left = ""
+            if self.items:
+                left = "%s \u00b7 %d/%d" % (self.items[self.sel].dlabel(self.sid == ALL), self.sel + 1, len(self.items))
+            right = "\u2190\u2192 item  m menu  ? help"
+        if self.worker.error:
+            left = "ERR: " + self.worker.error + "  " + left
+        room = max(0, cols - len(right) - 3)
+        text = " " + fit(left, room) + "  " + right + " "
+        self.w(self.at(L["footer"], 0) + "\x1b[7m" + fit(text, cols) + "\x1b[0m")
+
+    def help_lines(self):
+        cw_, ch_ = self.cell_px()
+        left = ["Keys", "\u2191\u2193 / j k   session or item", "\u2190\u2192 / h l   item", "Enter Tab   open right pane",
+                "Tab Esc s   back to sidebar", "g G   first / last", "PgUp PgDn J K   scroll text", "m   context menu",
+                "d   hide / unhide", "u   undo hide", "H   show hidden", "y   copy path", "b   toggle sidebar",
+                "[ ]   adjust image scale", "r   redraw", "q   quit"]
+        right = ["Mouse", "click   select row / thumbnail", "click divider   toggle sidebar", "wheel   scroll / next item",
+                 "drag over text   select + copy", "double-click   select word", "right-click   context menu", "",
+                 "Terminal", "cell %dx%d (%s)" % (cw_, ch_, self.cellsrc), "image scale %.2f" % self.cellscale, "",
+                 "any key or click closes"]
+        return left, right
+
+    def help_geom(self):
+        r, c, _, _ = winsize()
+        left, right = self.help_lines()
+        wl = max(sum(cwidth(ch) for ch in x) for x in left)
+        wr = max(sum(cwidth(ch) for ch in x) for x in right)
+        maxw = max(8, c - 2)
+        if wl + wr + 5 > maxw:                                     # shrink the columns to fit a narrow window
+            wl = max(4, (maxw - 5) * wl // (wl + wr))
+            wr = max(4, maxw - 5 - wl)
+        w = wl + wr + 5
+        h = min(max(len(left), len(right)) + 2, max(3, r - 2))
+        return max(0, (r - 1 - h) // 2), max(0, (c - w) // 2), w, h, wl, wr
+
+    def help_bytes(self):
+        row, col, w, h, wl, wr = self.help_geom()
+        left, right = self.help_lines()
+        n = h - 2
+        out = [self.at(row, col) + "\x1b[36m\u250c" + "\u2500" * (w - 2) + "\u2510\x1b[0m"]
+        for i in range(n):
+            l = left[i] if i < len(left) else ""
+            rr = right[i] if i < len(right) else ""
+            hdr = "\x1b[1m" if i == 0 or rr in ("Terminal",) else ""
+            out.append(self.at(row + 1 + i, col) + "\x1b[36m\u2502\x1b[0m " + ("\x1b[1m" if i == 0 else "") + fit(l, wl) + "\x1b[0m "
+                       + "\x1b[36m\u2502\x1b[0m " + hdr + fit(rr, wr) + "\x1b[0m\x1b[36m\u2502\x1b[0m")
+        out.append(self.at(row + h - 1, col) + "\x1b[36m\u2514" + "\u2500" * (w - 2) + "\u2518\x1b[0m")
+        return "".join(out).encode("utf-8")
+
+    def open_help(self):
+        self.help = True
+        self.flush(force=True)
+
+    def close_help(self):
+        if self.help:
+            g = self.help_geom()
+            self.help = False
+            self.restore_rect(g[0], g[1], g[2], g[3])
+
+    # ---- right pane drawing
+    def chrome(self, L, i, selected):
+        p = cell_pos(L, i)
+        if not p:
+            return
+        r, c = p
+        it = self.items[i]
+        tw = L["tw"]
+        sty = "\x1b[7m" if selected else "\x1b[2m"
+        self.w(self.atx(r, c) + sty + " " * tw + "\x1b[0m")
+        self.w(self.atx(r + TH - 1, c) + sty + fit((" \u2298" if it.hidden else " ") + it.dlabel(self.sid == ALL), tw) + "\x1b[0m")
+
+    def text_thumb(self, r, c, tw, it):
+        inner = tw - 2
+        lines = clean(it.text).split("\n")
+        first = next((l.strip() for l in lines if l.strip()), "")
+        self.w(self.atx(r + 1, c) + " ┌" + "─" * (inner - 2) + "┐")
+        self.w(self.atx(r + 2, c) + " │" + fit(first, inner - 2) + "│")
+        self.w(self.atx(r + 3, c) + " │" + fit("+%d lines" % it.nlines, inner - 2) + "│")
+        self.w(self.atx(r + 4, c) + " │" + fit("%d chars" % len(it.text), inner - 2) + "│")
+        self.w(self.atx(r + 5, c) + " └" + "─" * (inner - 2) + "┘")
+
+    def strip(self, L):
+        self.blankx(L["strip_top"], L["sep"], 0, L["cols"])
+        thumbs = [p for p in self.placements() if p["kind"] == "thumb"]
+        for i, it in enumerate(self.items):
+            pos = cell_pos(L, i)
+            if not pos:
+                continue
+            if it.kind == "txt":
+                self.text_thumb(pos[0], pos[1], L["tw"], it)
+            else:
+                for p in thumbs:
+                    if p["r"] == pos[0] + 1 and p["c"] == pos[1] + 1:
+                        self.draw_place(p)
+            self.chrome(L, i, i == self.sel)
+        self.w(self.atx(L["sep"], 0) + "─" * L["cols"])
+
+    def item_path(self, it):
+        return it.path or ""
+
+    def info_row(self, L):
+        it = self.items[self.sel]
+        proj = self.projs.get(it.sid, self.project)
+        idt = it.sid[:8] + " "
+        txt = " %s \u00b7 %s \u00b7 %s%s" % (it.dlabel(self.sid == ALL), rel_time(it.ts) if it.ts else "?", proj,
+                                             " \u00b7 hidden" if it.hidden else "")
+        self.w(self.atx(L["prev_top"], 0) + "\x1b[1m" + fit(txt, L["cols"] - len(idt)) + "\x1b[0m\x1b[2m" + idt + "\x1b[0m")
+        self.path_row(L)
+
+    def preview(self, L):
+        self.blankx(L["prev_top"], L["prev_top"] + L["prev_h"], 0, L["cols"])
+        if not self.items:
+            self.w(self.atx(L["prev_top"], 1) + "waiting for pasted images / text...")
+            return
+        self.info_row(L)
+        it = self.items[self.sel]
+        if it.kind == "img":
+            for p in self.placements():
+                if p["kind"] == "prev":
+                    self.draw_place(p)
+        else:
+            self.text_body(L)
+
+    def L(self):
+        r, c, _, _ = winsize()
+        _, self.x0 = sidebar_geom(c, self.show_side)
+        L = layout(c - self.x0, r, len(self.items), self.sel, self.first_row)
+        self.first_row = L["first_row"]
+        return L
+
+    # ---- sessions
+    def side_idx(self):
+        return next((i for i, e in enumerate(self.rows) if e["sid"] == self.sel_sid), 0)
+
+    def draw_right(self, L):
+        r, c, _, _ = winsize()
+        self.blank(1, r - 1, self.x0, c - self.x0)       # spaces over old sixel, right pane only
+        self.header(c)
+        if L["body_h"] < 2:
+            self.w(self.at(min(2, r - 1), self.x0) + fit("too small - enlarge the pane", c - self.x0))
+        else:
+            self.strip(L)
+            self.preview(L)
+        self.footer(L)
+
+    def draw_all(self):
+        if self.menu:                                         # layout changed (resize / toggle): drop the popup
+            self.menu = None
+            self.w("\x1b[?1003l\x1b[?1002h")
+        self.clear_sel()                           # geometry / wrapping may have changed
+        r, c, _, _ = winsize()
+        L = self.L()
+        self.w("\x1b[2J")
+        self.draw_sidebar(r)
+        self.draw_right(L)
+        self.flush()
+        self.sync()
+
+    def load_selected(self):
+        self.clear_sel()
+        """Point the right pane at sel_sid (reset state); items are loaded by refresh()."""
+        e = next((x for x in self.rows if x["sid"] == self.sel_sid), None)
+        self.sid = self.sel_sid
+        self.project = e["proj"] if e else ""
+        self.title = e.get("title", "") if e else ""
+        self.sig, self.items, self.sel, self.first_row, self.text_off = None, [], 0, 0, 0
+
+    def side_move(self, d=None, to=None):
+        if not self.rows:
+            return
+        i = to if to is not None else self.side_idx() + d
+        new = self.rows[max(0, min(len(self.rows) - 1, i))]["sid"]
+        if new != self.sel_sid:
+            self.clear_sel()
+            self.sel_sid, self.sfree = new, False
+            self.refresh()
+
+    def set_focus(self, f):
+        if f != self.focus:
+            self.clear_sel()
+            self.focus = f
+            r, c, _, _ = winsize()
+            L = self.L()
+            self.draw_sidebar(r)
+            self.header(c)
+            self.footer(L)
+            self.flush()
+
+    def requery_cell(self):
+        if os.environ.get("CCPASTE_CELL"):
+            return
+        q = query_cell_px(self.term) if self.term else None
+        if q:
+            self.cellpx, self.cellsrc = q, "16t"
+
+    def copy_path(self):
+        if self.items:
+            p = self.item_path(self.items[self.sel])
+            if p:
+                self.copy_and_flash(p, "copied path")
+
+    # ---- selection + mouse
+    def path_display(self, L):
+        return fit_left(self.item_path(self.items[self.sel]), L["cols"] - 1).rstrip()
+
+    def sel_lines(self, region, L):
+        if region == "path":
+            return [self.path_display(L)]
+        return wrap_text(self.items[self.sel].text, L["cols"] - 2)
+
+    def sel_span(self, region, row):
+        st = self.sel_state
+        if not st or st["region"] != region or st["state"] == "pressed":
+            return None
+        a, b = sorted([st["anchor"], st["cursor"]])
+        if not a[0] <= row <= b[0]:
+            return None
+        return (a[1] if row == a[0] else 0), (b[1] if row == b[0] else None)
+
+    def text_body(self, L):
+        it = self.items[self.sel]
+        lines = wrap_text(it.text, L["cols"] - 2)
+        self.text_off = max(0, min(self.text_off, max(0, len(lines) - L["body_h"])))
+        self.blankx(L["body_top"], L["body_top"] + L["body_h"], 0, L["cols"])
+        for k, ln in enumerate(lines[self.text_off:self.text_off + L["body_h"]]):
+            span = self.sel_span("text", self.text_off + k)
+            self.w(self.atx(L["body_top"] + k, 1) + (hl_line(ln, *span) if span else ln))
+
+    def path_row(self, L):
+        txt = self.path_display(L)
+        span = self.sel_span("path", 0)
+        self.w(self.atx(L["prev_top"] + 1, 0) + "\x1b[2m " + " " * (L["cols"] - 1) + "\x1b[0m")
+        self.w(self.atx(L["prev_top"] + 1, 1) + "\x1b[2m" + (hl_line(txt, *span) if span else txt) + "\x1b[0m")
+
+    def hit(self, x, y):
+        """Hit-test a 0-based cell -> ('side', idx) | ('divider',) | ('thumb', i) | ('strip',) | ('info',) |
+        ('path', col) | ('preview', col, row) | ('header',) | ('footer',) | None."""
+        r, c, _, _ = winsize()
+        L = self.L()
+        if y == 0:
+            return ("header",)
+        if y >= r - 1:
+            return ("footer",)
+        x0 = self.x0
+        if x0:
+            if x < x0 - 1:
+                idx = self.sfirst + (y - 1) // 2
+                if (y - 1) // 2 >= max(1, (r - 2) // 2) or idx >= len(self.rows):
+                    return ("side_blank",)
+                return ("side", idx)
+            if x == x0 - 1:
+                return ("divider",)
+        rx = x - x0
+        if L["strip_top"] <= y < L["sep"]:
+            k, col = (y - L["strip_top"]) // TH, rx // L["tw"]
+            i = (L["first_row"] + k) * L["per_row"] + col
+            return ("thumb", i) if col < L["per_row"] and i < len(self.items) else ("strip",)
+        if y == L["prev_top"]:
+            return ("info",)
+        if y == L["prev_top"] + 1:
+            return ("path", rx - 1)
+        if L["body_top"] <= y < L["body_top"] + L["body_h"]:
+            return ("preview", rx - 1, y - L["body_top"])
+        return None
+
+    # ---- overlays: toast + context menu (drawn last; restore_rect repairs what was underneath)
+    def toast_geom(self):
+        """Right-aligned (one column in from the edge), three rows tall, ending just above the footer row."""
+        r, c, _, _ = winsize()
+        inner = 2 + sum(cwidth(ch) for ch in self.toast["text"])          # marker + space, then the message
+        w = min(c, inner + 4)                                             # border and one pad cell on each side
+        return max(0, r - 1 - 3), max(0, c - w - 1), w, 3
+
+    def toast_bytes(self):
+        row, col, w, _ = self.toast_geom()
+        if w < 7:
+            return b""
+        t = self.toast
+        ok = t["color"] == "green"
+        cc = "\x1b[32m" if ok else "\x1b[33m"
+        msg = fit(t["text"], w - 6)
+        pad = " " * max(0, w - 6 - sum(cwidth(ch) for ch in msg))
+        out = (self.at(row, col) + cc + "\u256d" + "\u2500" * (w - 2) + "\u256e\x1b[0m"
+               + self.at(row + 1, col) + cc + "\u2502 " + ("\u2713" if ok else "!") + "\x1b[0m " + msg + pad + cc + " \u2502\x1b[0m"
+               + self.at(row + 2, col) + cc + "\u2570" + "\u2500" * (w - 2) + "\u256f\x1b[0m")
+        return out.encode("utf-8")
+
+    def show_toast(self, text, color="green", secs=TOAST_SECS):
+        self.toast = dict(text=text, color=color, until=self.clock() + secs)
+        self.flush(force=True)
+
+    def toast_tick(self):
+        if self.toast and self.clock() >= self.toast["until"]:
+            self.hide_toast()
+
+    def hide_toast(self):
+        if self.toast:
+            g = self.toast_geom()
+            self.toast = None
+            self.restore_rect(*g)
+
+    def restore_rect(self, row, col, w, h):
+        """Blank a popup's rectangle and redraw what was under it; a Sixel that overlapped is re-placed from the
+        cache (no re-encode), so no hole is left in the image."""
+        r, c, _, _ = winsize()
+        self.blank(row, row + h, col, w)
+        if not self._drawn:
+            self.flush()
+            return
+        L = self.L()
+        if L["body_h"] < 2:
+            self.draw_all()
+            return
+        if col < self.x0:
+            self.draw_sidebar(r)
+        if col + w > self.x0 and self.items:
+            if row <= L["sep"] and row + h > L["strip_top"]:
+                self.strip(L)
+            if row <= L["prev_top"] + 1 and row + h > L["prev_top"]:
+                self.info_row(L)
+            if row + h > L["body_top"]:
+                if self.items[self.sel].kind == "txt":
+                    self.text_body(L)
+                else:
+                    for p in self.placements():
+                        if p["kind"] != "prev":
+                            continue
+                        v = self.worker.get(p["key"])
+                        if v is None or v[0] is None:
+                            self.draw_place(p)
+                            continue
+                        xi = self.x0 + max(0, (p["w"] - v[1]) // 2)
+                        if not (row + h <= p["r"] or row >= p["r"] + v[2] or col + w <= xi or col >= xi + v[1]):
+                            self.draw_place(p)
+        if row + h > L["footer"]:
+            self.footer(L)
+        self.flush()
+
+    # ---- context menu
+    def selection_string(self):
+        if not self.sel_ok():
+            return ""
+        st, L = self.sel_state, self.L()
+        if st["region"] == "text":
+            return selection_text_src(self.items[self.sel].text, L["cols"] - 2, st["anchor"], st["cursor"])
+        return selection_text(self.sel_lines("path", L), st["anchor"], st["cursor"])
+
+    def menu_items(self, target):
+        """-> [(label, action, enabled)]. One menu for every item (image or text); sessions get their own."""
+        if target[0] == "session":
+            e = next((x for x in self.rows if x["sid"] == target[1]), None)
+            if not e or target[1] == ALL:
+                return []
+            return [("Unhide session" if e.get("hidden") else "Hide session", "hide_session", True),
+                    ("Copy session id", "copy_id", True)]
+        found = self.find_item(target[1])
+        if not found:
+            return []
+        it = found[1]
+        return [("Copy path", "copy_path", True), ("Copy object", "copy_object", True),
+                ("Unhide" if it.hidden else "Hide", "hide", True)]
+
+    def find_item(self, ref):
+        """(index, item) for an item key (sid, kind, num) or a plain index; None when it no longer exists"""
+        if isinstance(ref, int):
+            return (ref, self.items[ref]) if 0 <= ref < len(self.items) else None
+        for i, it in enumerate(self.items):
+            if it.key == ref:
+                return i, it
+        return None
+
+    def open_menu(self, target, px, py):
+        if self.menu:
+            self.close_menu()
+        if target[0] == "item":                                   # store the key, not the index: the list can change
+            found = self.find_item(target[1])
+            if not found:
+                return
+            target = ("item", found[1].key)
+        items = self.menu_items(target)
+        if not items:
+            return
+        r, c, _, _ = winsize()
+        h = len(items) + 2
+        w = min(max(sum(cwidth(ch) for ch in lab) for lab, _, _ in items) + 4, c - 1)
+        if w < 8 or h > r - 1:
+            self.show_toast("window too small for the menu", "yellow")
+            return
+        row, col = menu_geom(px, py, w, h, c, r)
+        first = next((i for i, it in enumerate(items) if it[2]), 0)
+        self.menu = dict(target=target, items=items, sel=first, row=row, col=col, w=w, h=h)
+        self.w("\x1b[?1003h")                                     # hover needs motion events while the menu is open
+        self.flush(force=True)
+
+    def close_menu(self):
+        m, self.menu = self.menu, None
+        if m:
+            self.w("\x1b[?1003l\x1b[?1002h")                     # back to button-event tracking
+            self.restore_rect(m["row"], m["col"], m["w"], m["h"])
+
+    def menu_fits(self):
+        r, c, _, _ = winsize()
+        m = self.menu
+        return m["row"] + m["h"] <= r - 1 and m["col"] + m["w"] <= c - 1
+
+    def menu_bytes(self):
+        m = self.menu
+        out = [self.at(m["row"], m["col"]) + "\x1b[36m\u250c" + "\u2500" * (m["w"] - 2) + "\u2510\x1b[0m"]
+        for i, (lab, _, en) in enumerate(m["items"]):
+            sty = ("\x1b[7m" if i == m["sel"] else "") + ("" if en else "\x1b[2m")
+            out.append(self.at(m["row"] + 1 + i, m["col"]) + "\x1b[36m\u2502\x1b[0m" + sty + " " + fit(lab, m["w"] - 4) + " \x1b[0m\x1b[36m\u2502\x1b[0m")
+        out.append(self.at(m["row"] + m["h"] - 1, m["col"]) + "\x1b[36m\u2514" + "\u2500" * (m["w"] - 2) + "\u2518\x1b[0m")
+        return "".join(out).encode("utf-8")
+
+    def menu_run(self):
+        m = self.menu
+        label, action, enabled = m["items"][m["sel"]]
+        if not enabled:
+            return                                                 # disabled rows do nothing and keep the menu open
+        target = m["target"]
+        self.close_menu()
+        self.menu_action(action, target)
+
+    def menu_action(self, action, target):
+        if action in ("copy_id", "hide_session") and not any(x["sid"] == target[1] for x in self.rows):
+            self.show_toast("session no longer exists", "yellow")
+        elif action == "copy_id":
+            self.copy_and_flash(target[1], "copied session id")
+        elif action == "hide_session":
+            self.hide_session(target[1])
+        elif target[0] == "item":
+            found = self.find_item(target[1])
+            if not found:
+                self.show_toast("item no longer exists", "yellow")
+            elif action == "copy_path":
+                self.copy_and_flash(self.item_path(found[1]), "copied path")
+            elif action == "copy_object":
+                self.copy_object(found[0])
+            elif action == "hide":
+                self.hide_item(found[0])
+
+    def copy_object(self, i):
+        """Text paste -> its full text; image -> the image itself on the clipboard (off the UI thread)."""
+        it = self.items[i]
+        if it.kind == "txt":
+            self.copy_and_flash(it.text)
+            return
+        q = self.term.q if self.term else None
+
+        def work():
+            ok = copy_image_blocking(it.path)
+            if q is not None:
+                if ok is True:
+                    q.put(("toast", ("copied image", "green")))
+                elif ok == "timeout":
+                    q.put(("toast", ("image copy timed out", "yellow")))      # clipboard left alone
+                else:
+                    q.put(("img_fail", it.path))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_img_fail(self, path):
+        copy_text(path, self.w, post=self.term.q.put if self.term else None)
+        self.flush()
+        self.show_toast("couldn't copy image \u2014 copied its path instead", "yellow")
+
+    def menu_key(self, k):
+        m = self.menu
+        n = len(m["items"])
+        if k in ("up", "k"):
+            m["sel"] = (m["sel"] - 1) % n
+            self.flush(force=True)
+        elif k in ("down", "j"):
+            m["sel"] = (m["sel"] + 1) % n
+            self.flush(force=True)
+        elif k in ("\r", "\n"):
+            self.menu_run()
+        elif k in (ESC, "q", "ctrl-c"):
+            self.close_menu()
+
+    def menu_mouse(self, ev):
+        m, k, x, y = self.menu, ev["kind"], ev["x"], ev["y"]
+        inside = m["col"] < x < m["col"] + m["w"] - 1 and m["row"] < y < m["row"] + m["h"] - 1
+        if k in ("move", "drag"):
+            if inside and y - m["row"] - 1 != m["sel"]:
+                m["sel"] = y - m["row"] - 1
+                self.flush(force=True)
+        elif k == "down" and ev["btn"] == 0:
+            if inside:
+                m["sel"] = y - m["row"] - 1
+                self.menu_run()
+            else:
+                self.close_menu()
+        elif k == "down" and ev["btn"] == 2:
+            self.close_menu()
+            self.on_rclick(x, y)
+
+    def open_menu_for_selection(self):
+        if self.focus == "side":
+            e = next((x for x in self.rows if x["sid"] == self.sel_sid), None)
+            if not e or e["sid"] == ALL:
+                self.show_toast("no menu for All sessions", "yellow")
+                return
+            self.open_menu(("session", e["sid"]), 4, 1 + 2 * (self.side_idx() - self.sfirst) + 1)
+        elif self.items:
+            L = self.L()
+            pos = cell_pos(L, self.sel)
+            if pos:
+                self.open_menu(("item", self.sel), self.x0 + pos[1] + 2, pos[0] + 2)
+            else:
+                self.open_menu(("item", self.sel), self.x0 + 4, L["body_top"] + 1)
+
+    def on_rclick(self, x, y):
+        if self.menu:
+            self.close_menu()
+        st = self.sel_state
+        if st:                                                    # a right-click cancels an ongoing drag-select
+            self.clear_sel()
+            self.redraw_sel(st["region"])
+        h = self.hit(x, y)
+        if not h:
+            return
+        if h[0] == "side" and h[1] < len(self.rows) and self.rows[h[1]]["sid"] != ALL:
+            self.select_row(h[1])
+            self.open_menu(("session", self.rows[h[1]]["sid"]), x, y)
+        elif h[0] == "thumb":
+            if self.focus != "main":
+                self.set_focus("main")
+            self.move(h[1])
+            self.open_menu(("item", h[1]), x, y)
+        elif h[0] in ("preview", "info", "path") and self.items:
+            if self.focus != "main":
+                self.set_focus("main")
+            self.open_menu(("item", self.sel), x, y)
+
+    def clear_sel(self):
+        self.sel_state, self.last_down = None, None
+
+    def sel_ok(self):
+        """selection still refers to the item it was anchored on (and a text selection to a text item)"""
+        st = self.sel_state
+        if not st:
+            return False
+        if not self.items or not 0 <= self.sel < len(self.items) or self.items[self.sel].key != st.get("key") \
+                or (st["region"] == "text" and self.items[self.sel].kind != "txt"):
+            self.clear_sel()
+            return False
+        return True
+
+    def on_clip_fail(self, text):
+        self.w(osc52(text))
+        self.flush()
+        self.show_toast(self._copy_label, "green")             # the terminal path is a normal route, not a warning
+
+    def copy_and_flash(self, text, label=None):
+        self._copy_label = label or "copied %d chars" % len(text)
+        copy_text(text, self.w, post=self.term.q.put if self.term else None)
+        self.show_toast(self._copy_label)
+
+    def redraw_sel(self, region):
+        if not self.items or (self.sel_state and not self.sel_ok()):
+            return
+        L = self.L()
+        if region == "path":
+            self.path_row(L)
+        elif self.items[self.sel].kind == "txt":
+            self.text_body(L)
+        self.flush()
+        self._sel_draw = time.time()
+
+    def select_row(self, idx):
+        self.sfree = False
+        if self.focus != "side":
+            self.set_focus("side")
+        if idx < len(self.rows):
+            self.sel_sid = self.rows[idx]["sid"]
+            self.refresh()
+
+    def on_mouse(self, ev):
+        k = ev["kind"]
+        self.mouse_pos = (ev["x"], ev["y"])
+        if self.help:
+            if k == "down":
+                self.close_help()
+        elif self.menu:
+            self.menu_mouse(ev)
+        elif k == "scroll":
+            self.on_wheel(ev)
+        elif ev["btn"] == 2 and k == "down":
+            self.on_rclick(ev["x"], ev["y"])
+        elif ev["btn"] == 0 and k == "down":
+            self.on_down(ev["x"], ev["y"])
+        elif ev["btn"] == 0 and k == "drag":
+            self.on_drag(ev["x"], ev["y"])
+        elif ev["btn"] == 0 and k == "up":
+            self.on_up(ev["x"], ev["y"])
+
+    def on_wheel(self, ev):
+        if ev["dir"] not in ("up", "down"):
+            return
+        d = -1 if ev["dir"] == "up" else 1
+        h = self.hit(ev["x"], ev["y"])
+        if not h:
+            return
+        if h[0] in ("side", "side_blank"):
+            r = winsize()[0]
+            vis = max(1, (r - 2) // 2)
+            self.sfirst = max(0, min(max(0, len(self.rows) - vis), self.sfirst + d))
+            self.sfree = True
+            self.draw_sidebar(r)
+            self.flush()
+        elif h[0] in ("thumb", "strip"):
+            self.move(self.sel + d)
+        elif h[0] in ("preview", "path", "info") and self.items:
+            if self.items[self.sel].kind == "txt":
+                self.scroll(3 * d)
+            else:
+                self.move(self.sel + d)
+
+    def on_down(self, x, y):
+        h = self.hit(x, y)
+        now = time.time()
+        if not h:
+            return
+        if h[0] == "side":
+            self.select_row(h[1])
+        elif h[0] == "divider":
+            self.toggle_sidebar()
+        elif h[0] == "thumb":
+            if self.focus != "main":
+                self.set_focus("main")
+            self.move(h[1])
+        elif h[0] in ("preview", "path") and self.items:
+            if self.focus != "main":
+                self.set_focus("main")
+            L = self.L()
+            if h[0] == "path":
+                region, row, col = "path", 0, max(0, h[1])
+            elif self.items[self.sel].kind == "txt":
+                region, row, col = "text", self.text_off + h[2], max(0, h[1])
+            else:
+                self.sel_state = None
+                return
+            lines = self.sel_lines(region, L)
+            if row >= len(lines):
+                self.sel_state = None
+                return
+            ld = self.last_down
+            if ld and now - ld[0] <= DBLCLICK_S and abs(x - ld[1]) <= 2 and y == ld[2] and ld[3] == region:
+                wr = word_range(lines[row], col)
+                self.last_down = None
+                if wr:
+                    self.sel_state = dict(region=region, anchor=(row, wr[0]), cursor=(row, wr[1]), state="word",
+                                          key=self.items[self.sel].key)
+                    self.redraw_sel(region)
+                    return
+            self.last_down = (now, x, y, region)
+            self.sel_state = dict(region=region, anchor=(row, col), cursor=(row, col), state="pressed",
+                                  key=self.items[self.sel].key)
+
+    def on_drag(self, x, y, force=False):
+        st = self.sel_state
+        if not st or st["state"] == "word" or not self.sel_ok():
+            return
+        L = self.L()
+        if st["region"] == "path":
+            row, col = 0, max(0, x - self.x0 - 1)
+        else:
+            lines = self.sel_lines("text", L)
+            top, bh = L["body_top"], L["body_h"]
+            if y < top:
+                self.text_off = max(0, self.text_off - autoscroll_step(top - y, bh))
+                row = self.text_off
+            elif y >= top + bh:
+                mx = max(0, len(lines) - bh)
+                self.text_off = min(mx, self.text_off + autoscroll_step(y - (top + bh) + 1, bh))
+                row = self.text_off + bh - 1
+            else:
+                row = self.text_off + (y - top)
+            row = max(0, min(len(lines) - 1, row))
+            col = max(0, min(L["cols"] - 3, x - self.x0 - 1))
+        st["cursor"] = (row, col)
+        if st["cursor"] != st["anchor"]:
+            st["state"] = "extending"
+        if st["state"] == "extending" and (force or time.time() - self._sel_draw >= REPAINT_MIN_S):
+            self.redraw_sel(st["region"])
+
+    def on_up(self, x, y):
+        if not self.sel_ok():
+            return
+        st = self.sel_state
+        text = self.selection_string() if st["state"] in ("extending", "word") else ""
+        self.sel_state = None                              # highlight disappears after the copy
+        if st["state"] in ("extending", "word"):
+            self.redraw_sel(st["region"])
+            if text:
+                self.copy_and_flash(text)
+
+    def sel_tick(self):
+        st = self.sel_state
+        if st and st["state"] == "extending" and st["region"] == "text" and self.sel_ok():
+            L = self.L()
+            y = self.mouse_pos[1]
+            if y < L["body_top"] or y >= L["body_top"] + L["body_h"]:
+                self.on_drag(self.mouse_pos[0], y, force=True)
+
+    def flash_msg(self, text, secs=3.0):
+        self.show_toast(text, "green", secs)
+
+    def after_hide(self, token, now_hidden, label):
+        self.ssig = None
+        if now_hidden:
+            self.undo_stack.append(token)
+            msg = "hidden %s \u00b7 u to undo" % label
+        else:
+            msg = "unhidden %s" % label
+        self.refresh()
+        self.show_toast(msg, "green", 4.0)
+
+    def hide_session(self, sid):
+        e = next((x for x in self.rows if x["sid"] == sid), None)
+        if sid == ALL or not e:
+            return
+        if e.get("auto_hidden"):
+            self.flash_msg("hidden by age (auto_hide_days); not toggled")
+            return
+        nowh = HIDE.toggle_session(sid)
+        if nowh and not self.show_hidden and sid == self.sel_sid:
+            ids = [x["sid"] for x in self.rows]
+            i = ids.index(sid)
+            self.sel_sid = ids[i + 1] if i + 1 < len(ids) else ids[i - 1]
+        lab = e.get("title") or sid[:8]
+        self.after_hide(("session", sid, lab), nowh, lab)
+
+    def hide_item(self, i):
+        if not 0 <= i < len(self.items):
+            return
+        it = self.items[i]
+        nowh = HIDE.toggle_item(it.sid, it.kind, it.num)
+        lab = it.dlabel(self.sid == ALL)
+        self.after_hide(("item", it.sid, it.kind, it.num, lab), nowh, lab)
+
+    def hide_key(self):
+        """d: hide the selected session (sidebar) / item (right pane); un-hides a target that is already hidden"""
+        if self.focus == "side":
+            self.hide_session(self.sel_sid)
+        else:
+            self.hide_item(self.sel)
+
+    def undo_hide(self):
+        """u: revert the most recent hide(s) of this run"""
+        while self.undo_stack:
+            tok = self.undo_stack.pop()
+            if tok[0] == "session" and tok[1] in HIDE.sessions:
+                HIDE.toggle_session(tok[1])
+                self.sel_sid = tok[1]
+            elif tok[0] == "item" and HIDE.item_hidden(tok[1], tok[2], tok[3]):
+                HIDE.toggle_item(tok[1], tok[2], tok[3])
+            else:
+                continue
+            self.ssig = None
+            self.refresh()
+            self.show_toast("restored %s" % tok[-1])
+            return
+        self.flash_msg("nothing to undo")
+
+    def toggle_show_hidden(self):
+        self.show_hidden = not self.show_hidden
+        self.ssig = None
+        self.refresh()
+        self.flash_msg("showing hidden (dimmed) \u2014 d un-hides" if self.show_hidden else "hidden items are hidden again")
+
+    def toggle_sidebar(self):
+        self.show_side = not self.show_side
+        self.draw_all()
+
+    def move(self, new):
+        if not self.items:
+            return
+        new = max(0, min(len(self.items) - 1, new))
+        if new == self.sel:
+            return
+        old, old_first = self.sel, self.first_row
+        self.clear_sel()
+        self.sel, self.text_off = new, 0
+        L = self.L()
+        if L["first_row"] != old_first or L["body_h"] < 2:
+            self.draw_all()
+            return
+        self.chrome(L, old, False)
+        self.chrome(L, new, True)
+        self.preview(L)
+        self.footer(L)
+        self.flush()
+        self.sync()
+
+    def scroll(self, d):
+        if self.items and self.items[self.sel].kind == "txt" and self.L()["body_h"] >= 2:
+            L = self.L()
+            self.text_off = max(0, self.text_off + d)
+            self.preview(L)
+            self.footer(L)
+            self.flush()
+
+    def refresh(self):
+        sess = build_sessions(always=(self.sel_sid,) if self.pinned and self.sel_sid else (), show_hidden=self.show_hidden)
+        self.rows = [all_entry(sess)] + sess
+        self.projs = {e["sid"]: e["proj"] for e in sess}
+        ids = [e["sid"] for e in self.rows]
+        if self.sel_sid not in ids:
+            self.sel_sid = ids[1] if len(ids) > 1 else ids[0]
+        changed_session = self.sel_sid != self.sid
+        if changed_session:
+            self.load_selected()
+        else:
+            cur = next((x for x in self.rows if x["sid"] == self.sid), None)
+            if cur and cur.get("title", "") != self.title:
+                self.title = cur.get("title", "")
+                if self._drawn:
+                    self.header(winsize()[1])
+        items = list_items_all(sess, self.show_hidden) if self.sid == ALL else list_items(self.sid, self.show_hidden)
+        sig = [(i.key, i.sig, i.hidden) for i in items]
+        r, c, _, _ = winsize()
+        _, x0 = sidebar_geom(c, self.show_side)
+        now = time.time()
+        ssig = (self.sel_sid, self.focus, r, c, x0, [side_row(e, max(1, x0 - 1), now) for e in self.rows])
+        side_changed = ssig != self.ssig
+        self.ssig = ssig
+        items_changed = sig != self.sig
+        if items_changed:
+            self.clear_sel()
+            old_keys = {i.key for i in self.items}
+            sel_key = self.items[self.sel].key if self.items else None
+            first = self.sig is None
+            self.sig, self.items = sig, items
+            new = [k for k, i in enumerate(items) if i.key not in old_keys]
+            if items and (first or new):
+                self.sel = new[-1] if new and not first else len(items) - 1
+            elif sel_key:
+                self.sel = next((k for k, i in enumerate(items) if i.key == sel_key), min(self.sel, max(0, len(items) - 1)))
+            self.text_off = 0
+        if side_changed and not items_changed and not changed_session:
+            self.draw_sidebar(r)
+            self.flush()
+        elif items_changed or changed_session:
+            if not self._drawn:
+                self._drawn = True
+                self.draw_all()
+            else:
+                L = self.L()
+                self.draw_sidebar(r)
+                self.draw_right(L)
+                self.flush()
+                self.sync()
+
+    def handle_key(self, k):
+        """-> True to quit"""
+        if self.help:
+            self.close_help()                                      # any key closes the help overlay
+            return False
+        if self.menu:
+            self.menu_key(k)
+            return False
+        if k in ("q", "ctrl-c"):
+            return True
+        if k == "?":
+            self.open_help()
+            return False
+        if k == "m":
+            self.open_menu_for_selection()
+            return False
+        if k == "b":
+            self.toggle_sidebar()
+        elif k == "r":
+            self.requery_cell()
+            self.draw_all()
+        elif k == "y":
+            self.copy_path()
+        elif k == "d":
+            self.hide_key()
+        elif k == "u":
+            self.undo_hide()
+        elif k == "H":
+            self.toggle_show_hidden()
+        elif k in ("[", "]"):
+            self.cellscale = max(0.3, min(3.0, self.cellscale * (0.9 if k == "[" else 1 / 0.9)))
+            self.draw_all()
+        elif self.focus == "side":
+            if k in ("up", "k"):
+                self.side_move(-1)
+            elif k in ("down", "j"):
+                self.side_move(1)
+            elif k == "g":
+                self.side_move(to=0)
+            elif k == "G":
+                self.side_move(to=len(self.rows) - 1)
+            elif k in ("\r", "\n", "right", "l", "\t"):
+                self.set_focus("main")
+        else:
+            if k in ("\t", ESC, "s"):
+                self.set_focus("side")
+                return False
+            L = self.L()
+            pr = L["per_row"]
+            if k in ("left", "h"):
+                self.move(self.sel - 1)
+            elif k in ("right", "l"):
+                self.move(self.sel + 1)
+            elif k in ("up", "k"):
+                self.move(self.sel - pr if self.sel - pr >= 0 else self.sel)
+            elif k in ("down", "j"):
+                self.move(self.sel + pr if self.sel + pr < len(self.items) else self.sel)
+            elif k == "g":
+                self.move(0)
+            elif k == "G":
+                self.move(len(self.items) - 1)
+            elif k == "pgdn":
+                self.scroll(max(1, L["body_h"] - 1))
+            elif k == "pgup":
+                self.scroll(-max(1, L["body_h"] - 1))
+            elif k == "J":
+                self.scroll(3)
+            elif k == "K":
+                self.scroll(-3)
+        return False
+
+    def handle_events(self, events):
+        """Drag events are coalesced (only the newest of a run is handled). -> True to quit"""
+        for i, (kind, payload) in enumerate(events):
+            if kind == "mouse":
+                if payload["kind"] in ("drag", "move") and i + 1 < len(events) and events[i + 1][0] == "mouse" \
+                        and events[i + 1][1]["kind"] == payload["kind"]:
+                    continue
+                self.on_mouse(payload)
+            elif kind == "key" and self.handle_key(payload):
+                return True
+        return False
+
+    def run(self, term):
+        q = term.q
+        self.term = term
+        self.worker.notify = lambda: q.put(("done", None))
+        self.refresh()
+        last_refresh, last_poll = time.time(), time.time()
+        last_size = winsize()[:2]
+        while True:
+            extending = bool(self.sel_state and self.sel_state["state"] == "extending")
+            timeout = 0.03 if extending else (0.05 if self.parser.buf else 0.1)
+            batch = []
+            try:
+                batch.append(q.get(timeout=timeout))
+                while True:
+                    batch.append(q.get_nowait())
+            except queue.Empty:
+                pass
+            events, quit_now, redraw, done = [], False, False, False
+            for kind, payload in batch:
+                if kind == "in":
+                    events += self.parser.feed(payload)
+                elif kind in ("quit", "eof"):
+                    quit_now = True
+                elif kind == "resize":
+                    redraw = True
+                elif kind == "done":
+                    done = True
+                elif kind == "clip_fail":
+                    self.on_clip_fail(payload)
+                elif kind == "toast":
+                    self.show_toast(*payload)
+                elif kind == "img_fail":
+                    self.on_img_fail(payload)
+                elif kind == "fatal":
+                    raise RuntimeError("input reader failed:\n" + payload)
+            events += self.parser.flush()
+            if quit_now:
+                return
+            if redraw:
+                self.draw_all()
+            if done:
+                keys = self.worker.take_done()
+                if keys:
+                    self.on_ready(keys)
+            if self.handle_events(events):
+                return
+            now = time.time()
+            if now - last_poll >= 0.1:                    # resize poll (SIGWINCH / console events also post one)
+                last_poll = now
+                size = winsize()[:2]
+                if size != last_size:
+                    last_size = size
+                    self.draw_all()
+            self.sel_tick()
+            self.toast_tick()
+            if self.flash and now >= self.flash_until:
+                self.flash = ""
+                if self.items:
+                    self.footer(self.L())
+                    self.flush()
+            if now - last_refresh >= 1.0:
+                last_refresh = now
+                self.refresh()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ccpaste", description="Browse images/text pasted into a Claude Code session.")
+    ap.add_argument("-s", "--session", help="session id prefix: open this session directly instead of the session list")
+    ap.add_argument("--list", action="store_true", help="print the session list (or, with -s, that session's items), then exit")
+    ap.add_argument("--hide-older", type=int, metavar="N", help="hide sessions whose last activity is older than N days (not saved)")
+    a = ap.parse_args()
+    HIDE.load()
+    if a.hide_older:
+        HIDE.auto_cli = a.hide_older
+    sid, proj = None, ""
+    if a.session:
+        m = match_sessions(a.session)
+        if not m:
+            print("no session matches %r" % a.session, file=sys.stderr)
+            return 1
+        exact = [x for x in m if x[0] == a.session]
+        if len(m) > 1 and not exact:
+            print("ambiguous session prefix %r, candidates:" % a.session, file=sys.stderr)
+            for k, ts, p in m:
+                print("  %s  %-24s  last activity %s" % (k[:8], p, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))), file=sys.stderr)
+            return 1
+        sid, _, proj = (exact or m)[0]
+    if a.list:
+        if sid:
+            print("session %s  %s" % (sid[:8], proj))
+            for it in list_items(sid):
+                print("%s\t%s" % (it.label, "image" if it.kind == "img" else "text +%d lines" % it.nlines))
+        else:
+            ss = build_sessions()
+            print("\u2605 All sessions\t\t\t\t%d img / %d txt" % (sum(e["nimg"] for e in ss), sum(e["ntxt"] for e in ss)))
+            for e in ss:
+                print("%s\t%s\t%s\t%s\t%d img / %d txt" % (e["title"], e["sid"][:8], e["proj"], rel_time(e["ts"]), e["nimg"], e["ntxt"]))
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("ccpaste needs a terminal", file=sys.stderr)
+        return 1
+    try:
+        import PIL.Image  # noqa: F401
+    except ImportError:
+        print("ccpaste needs Pillow: pip install --user pillow", file=sys.stderr)
+        return 1
+    app = App(sid, proj)
+    term = make_term()
+    sys.setswitchinterval(0.0005)     # keep the UI thread responsive while the worker encodes
+    atexit.register(term.restore)     # idempotent guard: finally + atexit + excepthook + signals all call restore()
+    orig_hook = sys.excepthook
+    sys.excepthook = lambda *a: (term.restore(), orig_hook(*a))
+    try:
+        term.enter()
+        env = os.environ.get("CCPASTE_CELL")
+        if env and re.fullmatch(r"\d+x\d+", env):
+            app.cellpx = tuple(int(x) for x in env.split("x"))
+            app.cellsrc = "CCPASTE_CELL"
+        else:
+            app.cellpx = query_cell_px(term)           # a terminal answer beats ioctl pixels (may include chrome)
+            app.cellsrc = "16t" if app.cellpx else "fallback"
+        app.run(term)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        term.restore()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
