@@ -2,9 +2,9 @@
 
 Sharp previews of everything you paste into Claude Code: images and text, every session, in your terminal via Sixel.
 
-English | [繁體中文](README.zh-TW.md)
+English | [繁體中文](https://github.com/louiswu1110/ccpaste/blob/main/README.zh-TW.md)
 
-![ccpaste demo](docs/demo.gif)
+![ccpaste demo](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/demo.gif)
 
 ## Why
 
@@ -21,30 +21,85 @@ Claude Code only draws real pictures in terminals that speak the kitty graphics 
 - Never modifies Claude Code's files and keeps no copies of your pastes; the only thing it writes is its own `hidden.json`.
 - A single Python file with one dependency (Pillow).
 
-## Quick start
+## Install
 
-Requirements: Python 3 and Pillow (`pip install --user pillow`), and a terminal that supports Sixel, for example Windows Terminal 1.22 or newer. macOS and Linux are supported as long as the terminal speaks Sixel; no other terminals have been verified.
+You need a terminal that speaks **Sixel**, for example Windows Terminal 1.22 or newer. macOS and Linux are supported as long as the terminal speaks Sixel; no other terminals have been verified. Run `ccpaste` in a second pane next to Claude Code.
 
-Symlink the single file `ccpaste` onto your PATH, then run it in a second pane next to Claude Code:
+### Recommended: from PyPI (all platforms)
 
 ```
-ln -s "$PWD/ccpaste" ~/.local/bin/ccpaste
-ccpaste
+uv tool install ccpaste
 ```
 
-(Copying the file onto your PATH works too.)
+Alternatives:
+
+```
+pipx install ccpaste
+pip install --user ccpaste
+```
+
+Need uv? Official installer ([docs](https://docs.astral.sh/uv/getting-started/installation/)):
+
+```
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+### Standalone binary (no Python needed)
+
+Download from the [Releases page](https://github.com/louiswu1110/ccpaste/releases). Assets:
+
+| Platform | Asset |
+|---|---|
+| Windows x86_64 | `ccpaste-windows-x86_64.zip` (contains `ccpaste-windows-x86_64.exe`) |
+| Linux x86_64 | `ccpaste-linux-x86_64` |
+| Linux aarch64 | `ccpaste-linux-aarch64` |
+| macOS Apple silicon | `ccpaste-macos-aarch64` |
+| macOS Intel | `ccpaste-macos-x86_64` |
+
+Windows (PowerShell):
+
+```powershell
+Invoke-WebRequest https://github.com/louiswu1110/ccpaste/releases/latest/download/ccpaste-windows-x86_64.zip -OutFile ccpaste.zip
+Expand-Archive ccpaste.zip -DestinationPath .
+.\ccpaste-windows-x86_64.exe
+```
+
+macOS / Linux (swap in your platform's asset name):
+
+```
+curl -L -o ccpaste https://github.com/louiswu1110/ccpaste/releases/latest/download/ccpaste-linux-x86_64
+chmod +x ccpaste
+./ccpaste
+```
+
+The binaries are unsigned. Windows SmartScreen may warn on first run (More info, then Run anyway). If you downloaded a binary with a browser, macOS quarantines it; clear the flag once with `xattr -d com.apple.quarantine ccpaste-macos-aarch64` (or the file name you downloaded). Binaries fetched with `curl` are not quarantined, so this is not needed for them.
+
+### From source
+
+Needs Python 3 and Pillow. The program is the single file `ccpaste`:
+
+```
+pip install --user pillow
+python3 ccpaste
+```
+
+Or put it on your PATH: `ln -s "$PWD/ccpaste" ~/.local/bin/ccpaste`.
 
 ## Screenshots
 
-![Image thumbnails and a large Sixel preview](docs/screenshot-preview.png)
+![Image thumbnails and a large Sixel preview](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/screenshot-preview.png)
 
 *Sessions on the left; a thumbnail strip and a large preview of the selected image on the right.*
 
-![A text paste with the copy toast](docs/screenshot-text.png)
+![A text paste with the copy toast](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/screenshot-text.png)
 
 *A text paste (`T#7`) shown as text; selecting text copies it and a green "copied N chars" toast confirms.*
 
-![The right-click context menu](docs/screenshot-menu.png)
+![The right-click context menu](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/screenshot-menu.png)
 
 *Right-click (or `m`) opens a context menu: Copy path, Copy object, Hide.*
 
@@ -154,4 +209,4 @@ ccpaste only reads Claude Code's files, never modifies them, and keeps no copies
 
 ## License
 
-[MIT](LICENSE) © 2026 Louis Wu
+[MIT](https://github.com/louiswu1110/ccpaste/blob/main/LICENSE) © 2026 Louis Wu

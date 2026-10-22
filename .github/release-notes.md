@@ -21,4 +21,4 @@ Verify downloads against `SHA256SUMS` (it lists every file, so unrelated lines a
 - macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`
 - Windows (PowerShell): `Get-FileHash <file>`, then compare the hash with the matching line in `SHA256SUMS`
 
-This is a pre-release. The automated test only checks that each binary starts and can render an image, not that it works interactively; the Windows and macOS builds have not yet been tried interactively.
+This is an early release. The automated test only checks that each binary starts and can render an image, not that it works interactively; the Windows and macOS builds have not yet been tried interactively.

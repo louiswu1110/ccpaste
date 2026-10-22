@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ccpaste"
+dynamic = ["version"]
+description = "Sharp previews of everything you paste into Claude Code: images and text, every session, in your terminal via Sixel."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Louis Wu" }]
+requires-python = ">=3.9"
+dependencies = ["pillow>=9.1"]   # Image.Quantize / Image.Dither / Image.Resampling enums arrived in Pillow 9.1.0
+keywords = ["claude", "claude-code", "sixel", "terminal", "tui", "clipboard"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/louiswu1110/ccpaste"
+Repository = "https://github.com/louiswu1110/ccpaste"
+Issues = "https://github.com/louiswu1110/ccpaste/issues"
+
+[project.scripts]
+ccpaste = "ccpaste:main"            # main() returns an int; the console-script wrapper does sys.exit(main())
+
+[tool.hatch.version]
+path = "ccpaste"                    # reads __version__ from the extensionless single file
+
+[tool.hatch.build.targets.wheel]
+only-include = ["ccpaste"]
+[tool.hatch.build.targets.wheel.force-include]
+"ccpaste" = "ccpaste.py"            # ship the extensionless file as module ccpaste.py
+
+[tool.hatch.build.targets.sdist]
+include = ["/ccpaste", "/LICENSE", "/README.md", "/README.zh-TW.md", "/tests", "/pyproject.toml"]

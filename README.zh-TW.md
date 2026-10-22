@@ -2,9 +2,9 @@
 
 清晰預覽你貼進 Claude Code 的所有內容：圖片與文字、每個 session，透過 Sixel 直接在終端機中顯示。
 
-[English](README.md) | 繁體中文
+[English](https://github.com/louiswu1110/ccpaste/blob/main/README.md) | 繁體中文
 
-![ccpaste demo](docs/demo.gif)
+![ccpaste demo](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/demo.gif)
 
 ## 為什麼需要它
 
@@ -21,30 +21,85 @@ Claude Code 只有在支援 kitty graphics protocol、Ghostty 或 iTerm2 的終�
 - 絕不修改 Claude Code 的檔案，也不保留你貼上內容的副本；唯一會寫入的是它自己的 `hidden.json`。
 - 單一 Python 檔案，只依賴一個套件（Pillow）。
 
-## 快速開始
+## 安裝
 
-需求：Python 3 與 Pillow（`pip install --user pillow`），以及支援 Sixel 的終端機，例如 Windows Terminal 1.22 或更新版本。只要終端機支援 Sixel，macOS 與 Linux 也能使用；其他終端機皆未驗證。
+需要支援 **Sixel** 的終端機，例如 Windows Terminal 1.22 或更新版本。只要終端機支援 Sixel，macOS 與 Linux 也能使用；其他終端機皆未驗證。請在 Claude Code 旁邊另開一個窗格執行 `ccpaste`。
 
-把單一檔案 `ccpaste` 以符號連結放到 PATH 中，然後在 Claude Code 旁邊的窗格執行：
+### 建議方式：從 PyPI 安裝（所有平台）
 
 ```
-ln -s "$PWD/ccpaste" ~/.local/bin/ccpaste
-ccpaste
+uv tool install ccpaste
 ```
 
-（直接把檔案複製到 PATH 也可以。）
+其他方式：
+
+```
+pipx install ccpaste
+pip install --user ccpaste
+```
+
+還沒有 uv？使用官方安裝指令（[文件](https://docs.astral.sh/uv/getting-started/installation/)）：
+
+```
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+### 獨立執行檔（不需要 Python）
+
+從 [Releases 頁面](https://github.com/louiswu1110/ccpaste/releases)下載。檔案對照：
+
+| 平台 | 檔案 |
+|---|---|
+| Windows x86_64 | `ccpaste-windows-x86_64.zip`（內含 `ccpaste-windows-x86_64.exe`） |
+| Linux x86_64 | `ccpaste-linux-x86_64` |
+| Linux aarch64 | `ccpaste-linux-aarch64` |
+| macOS Apple 晶片 | `ccpaste-macos-aarch64` |
+| macOS Intel | `ccpaste-macos-x86_64` |
+
+Windows（PowerShell）：
+
+```powershell
+Invoke-WebRequest https://github.com/louiswu1110/ccpaste/releases/latest/download/ccpaste-windows-x86_64.zip -OutFile ccpaste.zip
+Expand-Archive ccpaste.zip -DestinationPath .
+.\ccpaste-windows-x86_64.exe
+```
+
+macOS / Linux（請換成你平台對應的檔名）：
+
+```
+curl -L -o ccpaste https://github.com/louiswu1110/ccpaste/releases/latest/download/ccpaste-linux-x86_64
+chmod +x ccpaste
+./ccpaste
+```
+
+這些執行檔未經簽章。Windows SmartScreen 初次執行時可能跳出警告（按「其他資訊」再按「仍要執行」）。若是用瀏覽器下載的執行檔，macOS 會加上隔離標記（quarantine），需要先移除一次：`xattr -d com.apple.quarantine ccpaste-macos-aarch64`（或你下載的檔名）。用 `curl` 下載的執行檔不會被加上隔離標記，不需要這個指令。
+
+### 從原始碼執行
+
+需要 Python 3 與 Pillow。程式就是單一檔案 `ccpaste`：
+
+```
+pip install --user pillow
+python3 ccpaste
+```
+
+或把它放進 PATH：`ln -s "$PWD/ccpaste" ~/.local/bin/ccpaste`。
 
 ## 截圖
 
-![圖片縮圖與 Sixel 大圖預覽](docs/screenshot-preview.png)
+![圖片縮圖與 Sixel 大圖預覽](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/screenshot-preview.png)
 
 *左側為 session；右側為縮圖列與所選圖片的大圖預覽。*
 
-![文字貼上內容與複製提示](docs/screenshot-text.png)
+![文字貼上內容與複製提示](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/screenshot-text.png)
 
 *以文字顯示的文字貼上內容（`T#7`）；選取文字即複製，並以綠色「copied N chars」提示訊息確認。*
 
-![右鍵快顯選單](docs/screenshot-menu.png)
+![右鍵快顯選單](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/screenshot-menu.png)
 
 *按右鍵（或 `m`）開啟快顯選單：Copy path、Copy object、Hide。*
 
@@ -159,4 +214,4 @@ ccpaste 只讀取 Claude Code 的檔案，絕不修改，也不保留副本；�
 
 ## 授權
 
-[MIT](LICENSE) © 2026 Louis Wu
+[MIT](https://github.com/louiswu1110/ccpaste/blob/main/LICENSE) © 2026 Louis Wu

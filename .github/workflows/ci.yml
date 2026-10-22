@@ -15,6 +15,14 @@ jobs:
           python-version: "3.12"
       - run: pip install pillow==11.0.0
       - run: python -m unittest discover -s tests
+      - name: Packaging check (build wheel, install, run installed entry point)
+        run: |
+          pip install build
+          python -m build --wheel --outdir dist-ci
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist-ci/*.whl
+          /tmp/wheel-venv/bin/ccpaste --version
+          /tmp/wheel-venv/bin/ccpaste --selftest
 
   windows-smoke:
     runs-on: windows-latest

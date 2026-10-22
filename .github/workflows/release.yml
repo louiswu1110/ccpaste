@@ -48,6 +48,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Tag must match __version__
+        shell: bash
+        run: test "${GITHUB_REF_NAME#v}" = "$(sed -n 's/^__version__ = "\(.*\)"/\1/p' ccpaste)" || { echo "tag $GITHUB_REF_NAME != __version__"; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -62,10 +65,44 @@ jobs:
           cd ../dist
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
-      - name: Publish pre-release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --prerelease --title "ccpaste $GITHUB_REF_NAME" \
+            --title "ccpaste $GITHUB_REF_NAME" \
             --notes-file .github/release-notes.md --generate-notes
+
+  # Independent of `build`/`release` on purpose: a failed binary leg (e.g. the unverified macos-15-intel label)
+  # must not block the PyPI upload, and a PyPI failure must not block the GitHub release. The wheel is
+  # smoke-tested here before upload; a version already on PyPI can never be re-uploaded, so a failure means
+  # bump the version and tag again.
+  pypi:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi            # must match the environment name on the PyPI trusted-publisher entry
+    permissions:
+      id-token: write            # OIDC trusted publishing; no API token anywhere
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match __version__
+        shell: bash
+        run: test "${GITHUB_REF_NAME#v}" = "$(sed -n 's/^__version__ = "\(.*\)"/\1/p' ccpaste)" || { echo "tag $GITHUB_REF_NAME != __version__"; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build --outdir dist-pypi
+          ls -l dist-pypi
+      - name: Smoke-test the built wheel in a fresh venv
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist-pypi/*.whl
+          /tmp/wheel-venv/bin/ccpaste --version
+          /tmp/wheel-venv/bin/ccpaste --selftest
+          /tmp/wheel-venv/bin/python .github/scripts/smoke.py /tmp/wheel-venv/bin/ccpaste
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-pypi

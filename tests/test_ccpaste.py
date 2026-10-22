@@ -1519,6 +1519,11 @@ class T(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "selftest ok")
 
+    def test_version_flag(self):
+        r = subprocess.run([PATH, "--version"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout.strip(), r"^ccpaste \d+\.\d+\.\d+")
+
     def test_pty_sidebar(self):
         with fake_tree(("e6b6aaaa-0000-4000-8000-000000000001", "c3c3c3c3-0000-4000-8000-000000000002")) as (fenv, *_):
             self._pty_sidebar(fenv)

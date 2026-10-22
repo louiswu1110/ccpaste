@@ -3,6 +3,8 @@
 
 Stdlib + Pillow only.
 """
+__version__ = "0.1.0"
+
 import argparse, atexit, collections, json, os, queue, re, signal, struct, sys, threading, time, unicodedata
 
 IS_WIN = os.name == "nt"
@@ -2744,6 +2746,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="print the session list (or, with -s, that session's items), then exit")
     ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--hide-older", type=int, metavar="N", help="hide sessions whose last activity is older than N days (not saved)")
+    ap.add_argument("--version", action="version", version="ccpaste " + __version__)
     a = ap.parse_args()
     if a.selftest:                                        # CI: prove Pillow + the sixel encoder work in a frozen build
         try:
