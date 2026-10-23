@@ -3,7 +3,7 @@
 
 Stdlib + Pillow only.
 """
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 import argparse, atexit, collections, json, os, queue, re, signal, struct, sys, threading, time, unicodedata
 
@@ -818,8 +818,10 @@ def list_geom(cols, rows):
 # ---------------------------------------------------------------- platform layer
 MOUSE_ON = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1000h\x1b[?1002h\x1b[?1006h"   # reset stale modes, then set
 MOUSE_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l"
-ENTER_SEQ = "\x1b[?1049h\x1b[?25l" + MOUSE_ON
-LEAVE_SEQ = "\x1b[0m" + MOUSE_OFF + "\x1b[?25h\x1b[?1049l"
+TITLE_ON = "\x1b[22;0t\x1b]0;ccpaste\x07"     # save the tab title, then name the tab (else it shows "python")
+TITLE_OFF = "\x1b[23;0t"                       # restore the saved title
+ENTER_SEQ = TITLE_ON + "\x1b[?1049h\x1b[?25l" + MOUSE_ON
+LEAVE_SEQ = "\x1b[0m" + MOUSE_OFF + "\x1b[?25h\x1b[?1049l" + TITLE_OFF
 
 # Windows console mode bits (input / output handles)
 W_PROCESSED_IN, W_LINE, W_ECHO, W_WINDOW, W_MOUSE, W_QUICK, W_EXT, W_VTIN = 0x1, 0x2, 0x4, 0x8, 0x10, 0x40, 0x80, 0x200
@@ -960,7 +962,7 @@ class WinTerm(BaseTerm):
         if not cur.value & W_VTIN:                     # the bit did not stick: native records instead
             self.vt = False
             k.SetConsoleMode(self.hin, win_input_mode(self.old_in, False))
-        self.write(ENTER_SEQ if self.vt else "\x1b[?1049h\x1b[?25l")
+        self.write(ENTER_SEQ if self.vt else TITLE_ON + "\x1b[?1049h\x1b[?25l")
         for name in ("SIGBREAK", "SIGTERM"):
             if hasattr(signal, name):
                 signal.signal(getattr(signal, name), lambda *_: self.q.put(("quit", None)))

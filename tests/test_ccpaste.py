@@ -1790,6 +1790,8 @@ class T(unittest.TestCase):
         self.assertNotIn(b"Traceback", buf)
         self.assertIn(b"\x1bP9;1q", buf)
         self.assertIn(b"\x1b[?1049l", buf)
+        self.assertLess(buf.index(b"\x1b[22;0t"), buf.index(b"\x1b]0;ccpaste\x07"))   # title saved, then set ...
+        self.assertTrue(buf.rstrip().endswith(b"\x1b[23;0t"))                       # ... and restored on exit
         self.assertTrue(buf.rstrip().endswith(b"\x1b[?25h\x1b[?1049l") or b"\x1b[?25h" in buf[-40:])
 
 
