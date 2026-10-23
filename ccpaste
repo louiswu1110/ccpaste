@@ -3,7 +3,7 @@
 
 Stdlib + Pillow only.
 """
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import argparse, atexit, collections, json, os, queue, re, signal, struct, sys, threading, time, unicodedata
 
