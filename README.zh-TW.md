@@ -10,6 +10,10 @@
 
 Claude Code 只有在支援 kitty graphics protocol、Ghostty 或 iTerm2 的終端機才會畫出真正的圖片。其他環境，例如 WSL 下的 Windows Terminal，貼上的圖片只會顯示成模糊的半格字元縮圖。ccpaste 是一個小型 TUI，在 Claude Code 旁邊另開一個窗格執行：左側列出你的 session，右側透過 Sixel 清晰繪製所選 session 貼上的圖片，以及較長的文字貼上內容，標籤沿用 Claude Code 的命名（圖片為 `#1`、`#2`，文字貼上為 `T#5`）。
 
+差別如下，這是兩種繪製方式的示意圖（不是 Claude Code 的截圖）：
+
+![示意圖：半格字元終端機預覽，與同一張圖的清晰 Sixel 繪製並排對照](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/before-after.png)
+
 ## 功能
 
 - 以 Sixel 清晰預覽貼上的圖片：縮圖列加上大圖預覽。
@@ -23,7 +27,7 @@ Claude Code 只有在支援 kitty graphics protocol、Ghostty 或 iTerm2 的終�
 
 ## 安裝
 
-需要支援 **Sixel** 的終端機，例如 Windows Terminal 1.22 或更新版本。只要終端機支援 Sixel，macOS 與 Linux 也能使用；其他終端機皆未驗證。請在 Claude Code 旁邊另開一個窗格執行 `ccpaste`。
+需要支援 **Sixel** 的終端機，例如 Windows Terminal 1.22 或更新版本（見[終端機支援](#終端機支援)）。請在 Claude Code 旁邊另開一個窗格執行 `ccpaste`。
 
 ### 建議方式：從 PyPI 安裝（所有平台）
 
@@ -88,6 +92,27 @@ python3 ccpaste
 ```
 
 或把它放進 PATH：`ln -s "$PWD/ccpaste" ~/.local/bin/ccpaste`。
+
+## 終端機支援
+
+ccpaste 需要能繪製 Sixel 圖形的終端機。
+
+| 終端機 | 平台 | 狀態 |
+|---|---|---|
+| Windows Terminal 1.22+ | Windows（WSL） | 已驗證：ccpaste 就是在這個終端機上開發的 |
+| Windows Terminal 1.22+ | Windows（原生） | 可用，僅測試過一次 |
+| iTerm2 | macOS | 可用，僅測試過一次 |
+| WezTerm | Windows、macOS、Linux | 應該可用（支援 Sixel），未測試 |
+| foot | Linux | 應該可用（支援 Sixel），未測試 |
+| mlterm | Linux | 應該可用（支援 Sixel），未測試 |
+| xterm（`-ti vt340`） | Linux | 應該可用（支援 Sixel），未測試 |
+| Konsole 22.04+ | Linux | 應該可用（支援 Sixel），未測試 |
+| Terminal.app | macOS | 不支援（沒有 Sixel） |
+| Ghostty | macOS、Linux | 不支援（沒有 Sixel） |
+| kitty | macOS、Linux | 不支援（沒有 Sixel） |
+| Alacritty | Windows、macOS、Linux | 不支援（沒有 Sixel） |
+
+只支援 kitty graphics protocol 的終端機目前尚未支援。歡迎回報其他終端機的使用狀況。
 
 ## 截圖
 
@@ -177,7 +202,7 @@ ccpaste 執行期間會啟用滑鼠追蹤（按鈕事件追蹤，使用 SGR 座�
 
 ## Windows（原生）
 
-ccpaste 也能在 Windows Terminal 中從 cmd 或 PowerShell 直接執行，不需要 WSL：安裝 Python 3 與 Pillow（`pip install pillow`），使用 Windows Terminal 1.22 或更新版本（Sixel 所需），然後執行 `python ccpaste`（或 `python ccpaste -s <id>`）。它從 `%USERPROFILE%\.claude` 與 `.claude-*` 讀取 Claude Code 的檔案，並從 `<CLAUDE_CODE_TMPDIR 或 %TEMP%>\claude` 讀取貼上的圖片；圖片位置是依據第三方外掛對 Claude Code 的描述，未經驗證。**Windows 支援尚未在真實硬體上測試**：主控台設定（VT 輸入與輸出模式、raw input、關閉 quick-edit）、輸入讀取、原生剪貼簿與路徑處理皆已實作，但只有其純邏輯部分有在 Linux 上執行的測試涵蓋。若有問題，請回報。
+ccpaste 也能在 Windows Terminal 中從 cmd 或 PowerShell 直接執行，不需要 WSL：安裝 Python 3 與 Pillow（`pip install pillow`），使用 Windows Terminal 1.22 或更新版本（Sixel 所需），然後執行 `python ccpaste`（或 `python ccpaste -s <id>`）。它從 `%USERPROFILE%\.claude` 與 `.claude-*` 讀取 Claude Code 的檔案，並從 `<CLAUDE_CODE_TMPDIR 或 %TEMP%>\claude` 讀取貼上的圖片；圖片位置是依據第三方外掛對 Claude Code 的描述，未經驗證。**原生 Windows 已在真實硬體上（Windows Terminal）試過一次，可正常運作**；主控台設定（VT 輸入與輸出模式、raw input、關閉 quick-edit）、輸入讀取、原生剪貼簿與路徑處理皆已實作，但只有其純邏輯部分有自動化測試涵蓋（測試在 Linux 上執行）。若有問題，請回報。
 
 ## 快顯選單與提示訊息
 
@@ -208,7 +233,7 @@ ccpaste 只讀取 Claude Code 的檔案，絕不修改，也不保留副本；�
 ## 限制
 
 - 只有至少含一張貼上圖片或一段文字的 session 才會出現（或以 `-s` 指定的那一個）。Claude Code 已從 `paste-cache` 清除快取文字的貼上內容無法復原，也不會列出。
-- 繪製是針對 Windows Terminal 的 Sixel 行為開發的；其他終端機未測試。每張圖片的畫質受限於 256 色調色盤。
+- 繪製是針對 Windows Terminal 的 Sixel 行為開發的；其他終端機請見[終端機支援](#終端機支援)。每張圖片的畫質受限於 256 色調色盤。
 - 圖片在背景執行緒中解碼與編碼，因此很大的圖片會先短暫顯示佔位畫面。
 - 貼上的文字以純文字自動換行顯示；沒有搜尋功能。
 

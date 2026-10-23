@@ -10,6 +10,10 @@ English | [繁體中文](https://github.com/louiswu1110/ccpaste/blob/main/README
 
 Claude Code only draws real pictures in terminals that speak the kitty graphics protocol, Ghostty or iTerm2. Elsewhere, for example Windows Terminal under WSL, pasted images show up as blurry half-block thumbnails. ccpaste is a small TUI you run in a second pane next to Claude Code. It lists your sessions on the left and draws the selected session's pasted images sharply via Sixel, plus the long text pastes, labelled like Claude Code labels them (`#1`, `#2` for images, `T#5` for text pastes).
 
+Here is the difference, as an illustration of the two rendering styles (not a screenshot of Claude Code):
+
+![Illustration: a half-block terminal preview next to a sharp Sixel render of the same picture](https://raw.githubusercontent.com/louiswu1110/ccpaste/main/docs/before-after.png)
+
 ## Features
 
 - Sharp Sixel previews of pasted images: a thumbnail strip plus a large preview.
@@ -23,7 +27,7 @@ Claude Code only draws real pictures in terminals that speak the kitty graphics 
 
 ## Install
 
-You need a terminal that speaks **Sixel**, for example Windows Terminal 1.22 or newer. macOS and Linux are supported as long as the terminal speaks Sixel; no other terminals have been verified. Run `ccpaste` in a second pane next to Claude Code.
+You need a terminal that speaks **Sixel**, for example Windows Terminal 1.22 or newer (see [Terminal support](#terminal-support)). Run `ccpaste` in a second pane next to Claude Code.
 
 ### Recommended: from PyPI (all platforms)
 
@@ -88,6 +92,27 @@ python3 ccpaste
 ```
 
 Or put it on your PATH: `ln -s "$PWD/ccpaste" ~/.local/bin/ccpaste`.
+
+## Terminal support
+
+ccpaste needs a terminal that draws Sixel graphics.
+
+| Terminal | Platform | Status |
+|---|---|---|
+| Windows Terminal 1.22+ | Windows (WSL) | Verified: the terminal ccpaste was developed on |
+| Windows Terminal 1.22+ | Windows (native) | Works, tested once |
+| iTerm2 | macOS | Works, tested once |
+| WezTerm | Windows, macOS, Linux | Should work (supports Sixel), untested |
+| foot | Linux | Should work (supports Sixel), untested |
+| mlterm | Linux | Should work (supports Sixel), untested |
+| xterm (`-ti vt340`) | Linux | Should work (supports Sixel), untested |
+| Konsole 22.04+ | Linux | Should work (supports Sixel), untested |
+| Terminal.app | macOS | Not supported (no Sixel) |
+| Ghostty | macOS, Linux | Not supported (no Sixel) |
+| kitty | macOS, Linux | Not supported (no Sixel) |
+| Alacritty | Windows, macOS, Linux | Not supported (no Sixel) |
+
+Terminals that only speak the kitty graphics protocol are not supported yet. Reports from other terminals are welcome.
 
 ## Screenshots
 
@@ -172,7 +197,7 @@ Copying uses the native clipboard where possible (Windows: Win32 API; macOS: `pb
 
 ## Windows (native)
 
-ccpaste also runs in Windows Terminal from cmd or PowerShell, without WSL: install Python 3 and Pillow (`pip install pillow`), use Windows Terminal 1.22 or newer (for Sixel), then run `python ccpaste` (or `python ccpaste -s <id>`). It reads Claude Code's files from `%USERPROFILE%\.claude` and `.claude-*` and the pasted images from `<CLAUDE_CODE_TMPDIR or %TEMP%>\claude`; the images location is based on a third-party plugin's description of Claude Code and is unverified. **Windows support is untested on real hardware**: the console setup (VT input and output modes, raw input, quick-edit off), input reader, native clipboard and path handling are implemented but only their pure logic is covered by tests that run on Linux. Please report what breaks.
+ccpaste also runs in Windows Terminal from cmd or PowerShell, without WSL: install Python 3 and Pillow (`pip install pillow`), use Windows Terminal 1.22 or newer (for Sixel), then run `python ccpaste` (or `python ccpaste -s <id>`). It reads Claude Code's files from `%USERPROFILE%\.claude` and `.claude-*` and the pasted images from `<CLAUDE_CODE_TMPDIR or %TEMP%>\claude`; the images location is based on a third-party plugin's description of Claude Code and is unverified. **Native Windows has been tried once on real hardware** (Windows Terminal) and worked; the console setup (VT input and output modes, raw input, quick-edit off), input reader, native clipboard and path handling are implemented, but only their pure logic is covered by automated tests (which run on Linux). Please report what breaks.
 
 ## Context menu and toasts
 
@@ -203,7 +228,7 @@ ccpaste only reads Claude Code's files, never modifies them, and keeps no copies
 ## Limitations
 
 - Only sessions with at least one pasted image or text appear (or the one named with `-s`). Pastes whose cached text Claude Code has already pruned from `paste-cache` cannot be recovered and are not listed.
-- Rendering was developed against the Sixel behaviour of Windows Terminal; other terminals are untested. Image quality is limited to a 256-colour palette per image.
+- Rendering was developed against the Sixel behaviour of Windows Terminal; other terminals are covered in [Terminal support](#terminal-support). Image quality is limited to a 256-colour palette per image.
 - Images are decoded and encoded in a background thread, so a very large image shows a placeholder for a moment.
 - Pasted text is shown as plain wrapped text; there is no search.
 
