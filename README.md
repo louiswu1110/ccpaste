@@ -112,7 +112,7 @@ ccpaste --list           # print the sessions (title, id, project, time, counts)
 ccpaste --list -s <id>   # print that session's item labels and exit
 ```
 
-The screen is split: a sidebar of sessions on the left (first row "All sessions", then one two-line row per session: title with the 8-character id, then project, age and counts) and the selected session's content on the right (thumbnail strip, info line, large preview). Without `-s` the sidebar starts focused on the newest session; with `-s` the right pane starts focused. New items and sessions appear automatically (polled about once a second); a newly arrived item in the shown session becomes the selection.
+The screen is split: a sidebar of sessions on the left (first row "All sessions", then one row per session: the title, and the age (`now`, `7m`, `3h`, `37d`) dimmed on the right) and the selected session's content on the right (a header line with the title, project, 8-character id and image / text counts, then the thumbnail strip, info line and large preview; the selected thumbnail's label is highlighted). The id stays available through the right-click menu, "Copy session id". Without `-s` the sidebar starts focused on the newest session; with `-s` the right pane starts focused. New items and sessions appear automatically (polled about once a second); a newly arrived item in the shown session becomes the selection.
 
 | Focus | Key | Action |
 |---|---|---|

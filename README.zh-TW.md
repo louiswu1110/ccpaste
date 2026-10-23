@@ -117,7 +117,7 @@ ccpaste --list -s <id>   # print that session's item labels and exit
 * `ccpaste --list`：印出 session（標題、id、專案、時間、數量）後結束。
 * `ccpaste --list -s <id>`：印出該 session 的項目標籤後結束。
 
-畫面分為兩半：左側是 session 側邊欄（第一列為「All sessions」，之後每個 session 兩行：第一行為標題與 8 個字元的 id，第二行為專案、距今時間與數量），右側是所選 session 的內容（縮圖列、資訊列、大圖預覽）。未使用 `-s` 時，側邊欄預設焦點在最新的 session；使用 `-s` 時，預設焦點在右側窗格。新的項目與 session 會自動出現（約每秒輪詢一次）；目前顯示的 session 中新到達的項目會成為選取項目。
+畫面分為兩半：左側是 session 側邊欄（第一列為「All sessions」，之後每個 session 一行：標題，右側以淡色顯示距今時間，如 `now`、`7m`、`3h`、`37d`），右側是所選 session 的內容（標題列顯示標題、專案、8 個字元的 id 與圖片 / 文字數量，其下為縮圖列、資訊列、大圖預覽；所選縮圖的標籤以醒目色顯示）。id 仍可由右鍵選單的「Copy session id」複製。未使用 `-s` 時，側邊欄預設焦點在最新的 session；使用 `-s` 時，預設焦點在右側窗格。新的項目與 session 會自動出現（約每秒輪詢一次）；目前顯示的 session 中新到達的項目會成為選取項目。
 
 | 焦點 | 按鍵 | 動作 |
 |---|---|---|

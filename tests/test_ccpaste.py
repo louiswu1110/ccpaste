@@ -130,14 +130,14 @@ class T(unittest.TestCase):
         L = ccpaste.layout(120, 40, 7, 6)
         self.assertEqual(L["per_row"], 7)
         self.assertEqual(L["strip_rows"], 1)
-        self.assertEqual(L["prev_top"], 1 + 7 + 1)
-        self.assertEqual(L["prev_h"], 40 - 9 - 1)
-        self.assertEqual(L["body_top"], 11)
+        self.assertEqual(L["prev_top"], 1 + 6 + 1)
+        self.assertEqual(L["prev_h"], 40 - 8 - 1)
+        self.assertEqual(L["body_top"], 10)
         self.assertEqual(L["tw"], 17)               # 120 cols / 7 cells, stretched to the pane width
         self.assertEqual(ccpaste.tw_for(40), (2, 20))
-        L = ccpaste.layout(120, 40, 30, 29)       # 5 rows of thumbs, 1 visible, scrolled to selection
-        self.assertEqual(L["first_row"], 4)
-        self.assertEqual(ccpaste.cell_pos(L, 29)[0], 1)
+        L = ccpaste.layout(120, 40, 30, 29)       # 5 rows of thumbs, 2 visible, scrolled to selection
+        self.assertEqual((L["strip_rows"], L["first_row"]), (2, 3))
+        self.assertEqual(ccpaste.cell_pos(L, 29)[0], 1 + ccpaste.TH)
         self.assertIsNone(ccpaste.cell_pos(L, 0))
         self.assertEqual(ccpaste.fit_pixels(2000, 1000, 800, 600), (800, 400))
         self.assertEqual(ccpaste.fit_pixels(10, 10, 800, 600), (10, 10))
@@ -205,15 +205,16 @@ class T(unittest.TestCase):
             self.assertEqual(by["aaaa1111"]["proj"], "projA")
             self.assertAlmostEqual(by["aaaa1111"]["ts"], now - 5000, delta=2)   # latest history ts beats image mtime
             self.assertEqual(len(ccpaste.match_sessions("dddd")), 1)                # -s still sees empty sessions
-            l1, l2, idt = ccpaste.side_row(ss[2], 40, time.time())
-            self.assertTrue(idt.startswith("aaaa1111"))
-            self.assertIn("projA", l2)
-            self.assertIn("2 img / 1 txt", l2)
-            self.assertEqual(sum(ccpaste.cwidth(ch) for ch in l1 + idt), 40)
+            l1, tm = ccpaste.side_row(ss[2], 40, time.time())
+            self.assertEqual(tm, "1h ")                               # latest history ts = 5000s ago
+            self.assertTrue(l1.startswith(" first"))
+            self.assertNotIn("aaaa1111", l1 + tm)                     # id, project and counts left the sidebar
+            self.assertNotIn("projA", l1 + tm)
+            self.assertEqual(sum(ccpaste.cwidth(ch) for ch in l1 + tm), 40)
             self.assertEqual(by["aaaa1111"]["title"], "first \u4e2d\u6587 prompt [Pasted text #2 +3 lines]")   # no transcript -> prompt
             allrow = ccpaste.all_entry(ss)
             self.assertEqual(ccpaste.side_row(allrow, 40)[0].strip(), "\u2605 All sessions")
-            self.assertIn("3 img / 2 txt", ccpaste.side_row(allrow, 40)[1])
+            self.assertEqual(ccpaste.side_row(allrow, 40)[1], "5 ")
             # All view: every session's items, time ordered, newest last, labels carry the 4-char session prefix
             allitems = ccpaste.list_items_all(ss)
             self.assertEqual([i.dlabel(True) for i in allitems],
@@ -543,10 +544,9 @@ class T(unittest.TestCase):
                 self.assertEqual(app.hit(5, 0), ("header",))
                 self.assertEqual(app.hit(5, rows - 1), ("footer",))
                 self.assertEqual(app.hit(2, 1), ("side", 0))
-                self.assertEqual(app.hit(2, 2), ("side", 0))          # a row is two lines
-                self.assertEqual(app.hit(2, 3), ("side", 1))
-                self.assertEqual(app.hit(2, 5), ("side", 2))
-                self.assertEqual(app.hit(2, 7), ("side_blank",))
+                self.assertEqual(app.hit(2, 2), ("side", 1))          # one line per session
+                self.assertEqual(app.hit(2, 3), ("side", 2))
+                self.assertEqual(app.hit(2, 4), ("side_blank",))
                 self.assertEqual(app.hit(x0 - 1, 10), ("divider",))
                 self.assertEqual(app.hit(x0 + 1, L["strip_top"] + 1), ("thumb", 0))
                 self.assertEqual(app.hit(x0 + L["tw"] + 1, L["strip_top"] + 3), ("thumb", 1))
@@ -559,6 +559,135 @@ class T(unittest.TestCase):
                 app.L()
                 self.assertEqual(app.x0, 0)
                 self.assertEqual(app.hit(1, app.L()["strip_top"] + 1), ("thumb", 0))
+
+    def test_sidebar_one_row_per_session(self):
+        import unittest.mock as um
+        now = 1e6
+        ents = [dict(sid="s%d" % i, proj="proj", title="title %d" % i, ts=now - 86400 * 37, nimg=1, ntxt=1, prompt="")
+                for i in range(6)]
+        for sbw in (22, 33, 42):
+            for e in ents:
+                l, tm = ccpaste.side_row(e, sbw, now)
+                self.assertEqual(tm, "37d ")
+                self.assertEqual(sum(ccpaste.cwidth(ch) for ch in l + tm), sbw)
+                self.assertNotIn("\n", l)
+        with um.patch.object(ccpaste, "winsize", return_value=(40, 120, 0, 0)):
+            app = ccpaste.App()
+            app.rows = ents
+            app.x0 = 34
+            app.sel_sid = "s2"
+            app._out = []
+            app.w = app._out.append
+            app.blank = lambda *a: None
+            app.draw_sidebar(40)
+            out = "".join(app._out)
+            for k in range(6):                                   # session k sits on screen row 1 + k, nothing between
+                self.assertIn("\x1b[%d;1H" % (2 + k), out)
+            self.assertNotIn("\x1b[8;1H", out)
+            self.assertNotIn("proj", out)
+            for k in range(6):
+                self.assertEqual(app.hit(3, 1 + k), ("side", k))
+
+    def test_sidebar_title_time_gap_and_cjk(self):
+        now = 1e6
+        w = ccpaste.cwidth
+        for title in ("short", "x" * 80, "\u4e2d\u6587\u6a19\u984c" * 12, "a\u4e2d" * 30):
+            for sbw in (22, 23, 30, 42):
+                e = dict(sid="s1", proj="p", title=title, ts=now - 7 * 60, nimg=0, ntxt=0, prompt="")
+                l, tm = ccpaste.side_row(e, sbw, now)
+                self.assertEqual(tm, "7m ")
+                self.assertEqual(sum(w(ch) for ch in l + tm), sbw)
+                self.assertTrue(l.endswith("  "), (title, sbw, l))     # always >= 2 spaces before the time
+                if len(title) > 8 and sum(w(ch) for ch in " " + title) > sbw - 5:
+                    self.assertIn("\u2026", l)
+        self.assertEqual([ccpaste.rel_short(1000 - d, 1000) for d in (0, 59, 60, 7 * 60, 3 * 3600, 37 * 86400)],
+                         ["now", "now", "1m", "7m", "3h", "37d"])
+        self.assertEqual(ccpaste.side_row(dict(sid="s", proj="p", title="t", ts=0, nimg=0, ntxt=0, hidden=True), 30, 60)[0][:3],
+                         " \u2298 ")
+
+    def test_header_content(self):
+        parts = ["Louis", "c4045b9d", "0 img / 1 txt"]
+        full = " Mitmproxy \u5b89\u88dd \u00b7 Louis \u00b7 c4045b9d \u00b7 0 img / 1 txt"
+        for w in (sum(ccpaste.cwidth(ch) for ch in full) + 1, 80):
+            p, s = ccpaste.header_line("Mitmproxy \u5b89\u88dd", parts, w)
+            self.assertEqual((p + s).rstrip(), full)
+            self.assertEqual(p, " Mitmproxy \u5b89\u88dd")                 # primary and dimmed secondary are separate strings
+            self.assertTrue(s.startswith(" \u00b7 Louis"))
+            self.assertEqual(sum(ccpaste.cwidth(ch) for ch in p + s), w)
+        for w in (30, 40, 50):                                          # parts that do not fit are dropped, order kept
+            p, s = ccpaste.header_line("Mitmproxy \u5b89\u88dd", parts, w)
+            self.assertEqual(sum(ccpaste.cwidth(ch) for ch in p + s), w)
+            self.assertTrue(full.startswith((p + s).rstrip()))
+        self.assertNotIn("txt", "".join(ccpaste.header_line("Mitmproxy \u5b89\u88dd", parts, 40)))
+        p, s = ccpaste.header_line("x" * 100, parts, 71)                # long title: cut to make room, parts stay
+        self.assertTrue(p.rstrip().endswith("\u2026"))
+        self.assertIn("0 img / 1 txt", s)
+        self.assertEqual(sum(ccpaste.cwidth(ch) for ch in p + s), 71)
+        p, s = ccpaste.header_line("x" * 100, parts, 30)                # very narrow: title keeps half, extra parts drop
+        self.assertGreaterEqual(sum(ccpaste.cwidth(ch) for ch in p.rstrip()), 15)
+        self.assertNotIn("txt", s)
+        self.assertEqual(sum(ccpaste.cwidth(ch) for ch in p + s), 30)
+
+    def test_header_drawn_for_selected_session(self):
+        import unittest.mock as um
+        with um.patch.object(ccpaste, "winsize", return_value=(40, 120, 0, 0)):
+            app = self._app_with_items(1)
+            app.x0, app.title, app.project = 34, "Mitmproxy", "Louis"
+            app._out = []
+            app.w = app._out.append
+            app.header(120)
+            out = "".join(app._out)
+            self.assertIn("Mitmproxy", out)
+            self.assertIn(" \u00b7 Louis \u00b7 s1 \u00b7 0 img / 1 txt", out)
+
+    def test_strip_has_no_bar_row(self):
+        import unittest.mock as um
+        self.assertEqual(ccpaste.TH, ccpaste.THUMB_ROWS + 1)             # image rows + label, no bar
+        with um.patch.object(ccpaste, "winsize", return_value=(40, 120, 0, 0)):
+            app = self._app_with_items(3)
+            L = app.L()
+            self.assertEqual(L["sep"], L["strip_top"] + ccpaste.TH)
+            self.assertEqual(ccpaste.cell_pos(L, 0)[0], L["strip_top"])
+            app._out = []
+            app.w = app._out.append
+            app.blankx = lambda *a: None
+            app.chrome(L, 1, True)
+            out = "".join(app._out)
+            self.assertEqual(out.count("\x1b["+str(L["strip_top"] + ccpaste.TH) + ";"), 1)   # one write: the label row only
+            self.assertIn("1;7;36m", out)                               # selected label in highlight colour
+            self.assertEqual(out.count("\x1b[0m"), 1)
+            app._out.clear()
+            app.chrome(L, 0, False)
+            self.assertIn("\x1b[2m", "".join(app._out))
+            app._out.clear()
+            app.text_thumb(L["strip_top"], 0, L["tw"], app.items[0])    # text box starts on the first strip row
+            self.assertTrue(app._out[0].startswith("\x1b[%d;" % (L["strip_top"] + 1)))
+            self.assertEqual(len(app._out), 5)
+            app.items.append(ccpaste.Item("img", 9, path="/nonexistent/9.png", sid="s1", ts=1.0))
+            thumbs = [p for p in app.placements() if p["kind"] == "thumb"]
+            self.assertEqual(len(thumbs), 1)                            # the image cell gets a sixel placement
+            r0 = ccpaste.cell_pos(L, len(app.items) - 1)[0]
+            self.assertEqual(thumbs[0]["r"], r0)                        # image starts on the cell's first row ...
+            self.assertEqual(thumbs[0]["r"] + thumbs[0]["h"], r0 + ccpaste.TH - 1)   # ... and stops above the label
+            app.items.pop()
+            for k in range(ccpaste.TH):                                # every strip row hits a thumbnail, none is a dead bar
+                self.assertEqual(app.hit(app.x0 + 1, L["strip_top"] + k), ("thumb", 0))
+
+    def test_click_sidebar_row_selects_session(self):
+        import unittest.mock as um
+        with um.patch.object(ccpaste, "winsize", return_value=(40, 120, 0, 0)):
+            app = self._app_with_items()
+            app.sel_sid = "*"
+            app.refresh = lambda *a, **k: None
+            app.set_focus = lambda f: setattr(app, "focus", f)
+            for n in (1, 2, 0):
+                app.on_mouse(dict(kind="down", btn=0, x=3, y=1 + n))
+                app.on_mouse(dict(kind="up", btn=0, x=3, y=1 + n))
+                self.assertEqual(app.sel_sid, app.rows[n]["sid"])
+            app.rows = app.rows + [dict(sid="x%d" % i, proj="p", title="t", ts=0, nimg=1, ntxt=0, prompt="") for i in range(60)]
+            app.sfirst = 0
+            app.on_wheel(dict(dir="down", x=3, y=2))
+            self.assertEqual(app.sfirst, 1)
 
     def test_selection_text_cjk_multiline(self):
         lines = ["hello world", "\u4e2d\u6587\u5b57\u7b26 test", "third line"]
@@ -720,7 +849,7 @@ class T(unittest.TestCase):
             self.assertIn(b"\x1b[?1002h", buf)                       # mouse tracking enabled
             self.assertIn(b"\x1b[?1006h", buf)
             x0 = ccpaste.sidebar_geom(120)[1]
-            send("\x1b[<0;5;4M\x1b[<0;5;4m", 0.8)                  # click sidebar row (All sessions is row 0; this is row 1)
+            send("\x1b[<0;5;3M\x1b[<0;5;3m", 0.8)                  # click sidebar row (All sessions is row 0; this is row 1)
             send("\x1b[<0;%d;3M\x1b[<0;%d;3m" % (x0 + 4, x0 + 4), 0.8)          # click first thumbnail (the image)
             self.assertIn(b"\x1bP9;1q", buf)                         # sixel emitted
             send("\x1b[<65;%d;3M" % (x0 + 4))                       # wheel over thumbnails -> next item (text)
@@ -994,14 +1123,13 @@ class T(unittest.TestCase):
             ev = ccpaste.InputParser().feed("\x1b[<%d;5;5M" % cb)[0][1]
             self.assertEqual(ev["kind"], kind, cb)
         self.assertNotEqual(ccpaste.InputParser().feed("\x1b[<128;5;5M")[0][1]["kind"], "scroll")
-        with um.patch.object(ccpaste, "winsize", return_value=(39, 120, 0, 0)):      # rows-2 odd: last line is blank
+        with um.patch.object(ccpaste, "winsize", return_value=(39, 120, 0, 0)):      # 25 rows: lines below are blank
             app = ccpaste.App()
             app.rows = [dict(sid="s%d" % i, proj="p", title="t", ts=0, nimg=1, ntxt=0, prompt="") for i in range(25)]
-            self.assertEqual(app.hit(2, 36), ("side", 17))
-            self.assertEqual(app.hit(2, 35), ("side", 17))
-            self.assertEqual(app.hit(2, 37), ("side_blank",))
+            self.assertEqual(app.hit(2, 25), ("side", 24))
+            self.assertEqual(app.hit(2, 26), ("side_blank",))
             app.sfirst = 3
-            self.assertEqual(app.hit(2, 36), ("side", 20))
+            self.assertEqual(app.hit(2, 10), ("side", 12))
 
     def test_clipboard_tool_runs_off_the_ui_thread(self):
         import unittest.mock as um

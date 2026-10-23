@@ -11,7 +11,7 @@ IS_WIN = os.name == "nt"
 if not IS_WIN:                      # Unix-only modules must not be imported on Windows
     import fcntl, termios, tty
 
-TWMIN, TWMAX, TH = 16, 24, 7   # thumbnail cell: min/max columns, rows (bar, 5 image rows, label)
+TWMIN, TWMAX, TH = 16, 24, 6   # thumbnail cell: min/max columns, rows (5 image rows, label)
 RH = 7                         # session-list row: text line + 5 thumbnail rows + label line
 THUMB_ROWS = 5
 def default_tmp_root(environ=os.environ, win=IS_WIN):
@@ -112,6 +112,14 @@ def rel_time(ts, now=None):
     if d < 2 * 86400:
         return "yesterday"
     return "%dd ago" % (d // 86400)
+
+
+def rel_short(ts, now=None):
+    d = max(0, (now if now is not None else time.time()) - ts)
+    for n, u in ((86400, "d"), (3600, "h"), (60, "m")):
+        if d >= n:
+            return "%d%s" % (d // n, u)
+    return "now"
 
 
 # ---------------------------------------------------------------- hide list (never touches Claude Code's files)
@@ -492,6 +500,13 @@ def fit(s, w):
         out.append(ch)
         n += c
     return "".join(out) + " " * (w - n)
+
+
+def fit_ell(s, w):
+    """Fit to w display columns; text that does not fit ends with an ellipsis."""
+    if sum(cwidth(ch) for ch in s) <= w:
+        return fit(s, w)
+    return fit(fit(s, w - 1).rstrip(" ") + "\u2026", w)
 
 
 def fit_left(s, w):
@@ -1515,15 +1530,29 @@ def sidebar_geom(cols, on=True):
 
 
 def side_row(e, sbw, now=None):
-    """The two sidebar lines of one session (each exactly sbw display columns).
-    Line 1: title, then the 8-char id right-aligned. Line 2: project - relative time - counts."""
-    cnt = "%d img / %d txt" % (e["nimg"], e["ntxt"])
+    """One sidebar line per session -> (left, right), together exactly sbw columns: the title (ellipsis when cut,
+    at least 2 spaces before the time) and a compact dim relative time (the total count for All sessions)."""
     if e["sid"] == ALL:
-        return fit(" " + e["title"], sbw), fit("   " + cnt, sbw), ""
-    idw = 8
-    l1 = fit((" \u2298 " if e.get("hidden") else " ") + e["title"], sbw - idw - 1)
-    l2 = fit(" %s · %s · %s" % (e["proj"], rel_time(e["ts"], now), cnt), sbw)
-    return l1, l2, e["sid"][:idw] + " "
+        tm, pre = "%d " % (e["nimg"] + e["ntxt"]), " "
+    else:
+        tm, pre = rel_short(e["ts"], now) + " ", (" \u2298 " if e.get("hidden") else " ")
+    if sbw < len(tm) + 6:
+        tm = ""
+    return fit_ell(pre + e["title"], sbw - len(tm) - 2 * bool(tm)) + "  " * bool(tm), tm
+
+
+def header_line(title, parts, w):
+    """Right-pane header -> (primary, secondary), together exactly w columns. A long title is cut to half the width
+    so the parts still show; trailing parts that do not fit even then are dropped."""
+    tw, sec = sum(cwidth(ch) for ch in " " + title), ""
+    for p in parts:
+        nxt = sec + " \u00b7 " + p
+        if w - sum(cwidth(ch) for ch in nxt) - 1 < min(tw, w // 2):
+            break
+        sec = nxt
+    sw = sum(cwidth(ch) for ch in sec)
+    prim = fit_ell(" " + title, w - sw).rstrip(" ") if sec else fit_ell(" " + title, w)
+    return prim, fit(sec, w - sum(cwidth(ch) for ch in prim))
 
 
 class App:
@@ -1640,7 +1669,7 @@ class App:
             p = cell_pos(L, i)
             if p and t.kind == "img":
                 ps.append(dict(key=(t.path, t.sig, bw, bh), args=(t.path, bw, bh, cw_, ch_), kind="thumb",
-                               prio=1 + abs(i - self.sel), r=p[0] + 1, c=p[1] + 1, w=L["tw"] - 2, h=THUMB_ROWS))
+                               prio=1 + abs(i - self.sel), r=p[0], c=p[1] + 1, w=L["tw"] - 2, h=THUMB_ROWS))
         return ps
 
     def sync(self):
@@ -1692,12 +1721,12 @@ class App:
             self.w(self.at(0, sbw) + "\u2502")
         w = cols - self.x0
         base = "\x1b[2m" if side_on else "\x1b[1;7m"
+        cnt = "%d img / %d txt" % (sum(1 for t in self.items if t.kind == "img"), sum(1 for t in self.items if t.kind == "txt"))
         if self.sid == ALL:
-            txt, idt = " \u2605 All sessions \u00b7 %d items" % len(self.items), ""
+            prim, sec = header_line("\u2605 All sessions", [cnt], w)
         else:
-            txt = " %s \u00b7 %s \u00b7 %d items" % (self.title or "(untitled)", self.project, len(self.items))
-            idt = (self.sid or "")[:8] + " "
-        self.w(self.at(0, self.x0) + base + fit(txt, w - len(idt)) + "\x1b[0m" + base + "\x1b[2m" + idt + "\x1b[0m")
+            prim, sec = header_line(self.title or "(untitled)", [self.project, (self.sid or "")[:8], cnt], w)
+        self.w(self.at(0, self.x0) + base + prim + "\x1b[0m" + base + "\x1b[2m" + sec + "\x1b[0m")
 
     def divider(self, rows):
         if not self.x0:
@@ -1710,7 +1739,7 @@ class App:
         if not self.x0:
             return
         sbw = self.x0 - 1
-        vis = max(1, (rows - 2) // 2)
+        vis = max(1, rows - 2)
         idx = self.side_idx()
         if not self.sfree:
             self.sfirst = max(0, min(self.sfirst, idx))
@@ -1720,14 +1749,12 @@ class App:
         now = time.time()
         self.blank(1, rows - 1, 0, sbw)
         for k, e in enumerate(self.rows[self.sfirst:self.sfirst + vis]):
-            top = 1 + 2 * k
-            l1, l2, idt = side_row(e, sbw, now)
+            l, tm = side_row(e, sbw, now)
             sel = self.sfirst + k == idx
             if e.get("hidden") and not sel:
-                l1 = "\x1b[2m" + l1
+                l = "\x1b[2m" + l
             st = ("\x1b[7m" if self.focus == "side" else "\x1b[1m") if sel else ""
-            self.w(self.at(top, 0) + st + l1 + "\x1b[0m" + st + "\x1b[2m" * (not sel) + idt + "\x1b[0m")
-            self.w(self.at(top + 1, 0) + st + ("" if sel else "\x1b[2m") + l2 + "\x1b[0m")
+            self.w(self.at(1 + k, 0) + st + l + "\x1b[0m" + st + "\x1b[2m" * (not sel) + tm + "\x1b[0m")
         self.divider(rows)
 
     def footer(self, L):
@@ -1805,19 +1832,18 @@ class App:
         r, c = p
         it = self.items[i]
         tw = L["tw"]
-        sty = "\x1b[7m" if selected else "\x1b[2m"
-        self.w(self.atx(r, c) + sty + " " * tw + "\x1b[0m")
+        sty = "\x1b[1;7;36m" if selected else "\x1b[2m"
         self.w(self.atx(r + TH - 1, c) + sty + fit((" \u2298" if it.hidden else " ") + it.dlabel(self.sid == ALL), tw) + "\x1b[0m")
 
     def text_thumb(self, r, c, tw, it):
         inner = tw - 2
         lines = clean(it.text).split("\n")
         first = next((l.strip() for l in lines if l.strip()), "")
-        self.w(self.atx(r + 1, c) + " ┌" + "─" * (inner - 2) + "┐")
-        self.w(self.atx(r + 2, c) + " │" + fit(first, inner - 2) + "│")
-        self.w(self.atx(r + 3, c) + " │" + fit("+%d lines" % it.nlines, inner - 2) + "│")
-        self.w(self.atx(r + 4, c) + " │" + fit("%d chars" % len(it.text), inner - 2) + "│")
-        self.w(self.atx(r + 5, c) + " └" + "─" * (inner - 2) + "┘")
+        self.w(self.atx(r, c) + " ┌" + "─" * (inner - 2) + "┐")
+        self.w(self.atx(r + 1, c) + " │" + fit(first, inner - 2) + "│")
+        self.w(self.atx(r + 2, c) + " │" + fit("+%d lines" % it.nlines, inner - 2) + "│")
+        self.w(self.atx(r + 3, c) + " │" + fit("%d chars" % len(it.text), inner - 2) + "│")
+        self.w(self.atx(r + 4, c) + " └" + "─" * (inner - 2) + "┘")
 
     def strip(self, L):
         self.blankx(L["strip_top"], L["sep"], 0, L["cols"])
@@ -1830,7 +1856,7 @@ class App:
                 self.text_thumb(pos[0], pos[1], L["tw"], it)
             else:
                 for p in thumbs:
-                    if p["r"] == pos[0] + 1 and p["c"] == pos[1] + 1:
+                    if p["r"] == pos[0] and p["c"] == pos[1] + 1:
                         self.draw_place(p)
             self.chrome(L, i, i == self.sel)
         self.w(self.atx(L["sep"], 0) + "─" * L["cols"])
@@ -1984,8 +2010,8 @@ class App:
         x0 = self.x0
         if x0:
             if x < x0 - 1:
-                idx = self.sfirst + (y - 1) // 2
-                if (y - 1) // 2 >= max(1, (r - 2) // 2) or idx >= len(self.rows):
+                idx = self.sfirst + y - 1
+                if y - 1 >= max(1, r - 2) or idx >= len(self.rows):
                     return ("side_blank",)
                 return ("side", idx)
             if x == x0 - 1:
@@ -2240,7 +2266,7 @@ class App:
             if not e or e["sid"] == ALL:
                 self.show_toast("no menu for All sessions", "yellow")
                 return
-            self.open_menu(("session", e["sid"]), 4, 1 + 2 * (self.side_idx() - self.sfirst) + 1)
+            self.open_menu(("session", e["sid"]), 4, 2 + self.side_idx() - self.sfirst)
         elif self.items:
             L = self.L()
             pos = cell_pos(L, self.sel)
@@ -2343,7 +2369,7 @@ class App:
             return
         if h[0] in ("side", "side_blank"):
             r = winsize()[0]
-            vis = max(1, (r - 2) // 2)
+            vis = max(1, r - 2)
             self.sfirst = max(0, min(max(0, len(self.rows) - vis), self.sfirst + d))
             self.sfree = True
             self.draw_sidebar(r)
